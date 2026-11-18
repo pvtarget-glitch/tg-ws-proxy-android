@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Неофициальная сборка** [amurcanov/tg-ws-proxy-android](https://github.com/amurcanov/tg-ws-proxy-android) (v1.2.3) с исправлением CF-маршрутов после блокировки встроенных доменов 16.11.2026: быстрый перебор доменов и портов 80/443, рабочий свой CF-домен, CF Worker через поле «свой домен» (`имя.workers.dev`). APK — в [Releases](../../releases). Подпись отличается от официальной: перед установкой удалите официальное приложение.
+
 <div align="center">
   
   # Telegram WS Proxy Android
