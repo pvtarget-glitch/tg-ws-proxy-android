@@ -647,20 +647,18 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
     ) -> Option<(RawWebSocket, String)> {
-        let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
-        for worker_domain in self.available_domains(worker_domains).await {
-            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
-                .await
-            {
-                Ok(ws) => return Some((ws, worker_domain)),
-                Err(exc) => {
-                    self.report_failure(&worker_domain, &exc).await;
-                }
-            }
-        }
-        None
+        let targets: Vec<crate::cf_routes::Target> = self
+            .available_domains(worker_domains)
+            .await
+            .into_iter()
+            .map(|d| crate::cf_routes::Target { key: d.clone(), host: d })
+            .collect();
+        let what = format!("DC{} CF worker pool", dc);
+        crate::cf_routes::race(&targets, &path, crate::cf_routes::GROUP_WORKER, "pool", &what, true)
+            .await
+            .map(|(ws, target, _)| (ws, target.key))
     }
 
     pub async fn available_domains(&self, worker_domains: Vec<String>) -> Vec<String> {
@@ -1196,145 +1194,48 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Cfproxy fallback — мобильная версия (параллель + 429 cooldown + DoH),
-// путь и secure как в оригинале.
+// Cfproxy fallback: выбор маршрута в cf_routes::race (лесенка доменов и
+// режимов 80/443, память отказов, общий бюджет).
 // ---------------------------------------------------------------------------
-
-async fn try_cfproxy_base_domain(
-    dc: i32,
-    base_domain: &str,
-    ws_path: &str,
-) -> (Option<RawWebSocket>, String) {
-    let base_domain = normalize_cf_domain(base_domain);
-    if base_domain.is_empty() {
-        return (None, String::new());
-    }
-    let remaining = cfproxy_429_cooldown_remaining(&base_domain);
-    if remaining > Duration::ZERO {
-        ldebug!(
-            " CF skip {}: 429 cooldown {:.0}s",
-            base_domain,
-            remaining.as_secs_f64().ceil()
-        );
-        return (None, String::new());
-    }
-    let _permit = match acquire_cfproxy_attempt_slot().await {
-        Some(p) => p,
-        None => return (None, String::new()),
-    };
-
-    let domain = format!("kws{}.{}", dc, base_domain);
-    ldebug!(" CF try {}", domain);
-
-    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
-    if let Some(e) = err {
-        // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
-        // выжигал бы домены и плодил лавину cooldown.
-        if is_http_status_error(&e, 429) {
-            mark_cfproxy_429_cooldown(&base_domain, &e);
-        }
-        if !resolved_ip.is_empty() {
-            log_cf_conn_error(
-                &format!(" CF fail {} via {}: {}", domain, resolved_ip, e.compact()),
-                &e,
-            );
-        } else {
-            log_cf_conn_error(&format!(" CF fail {}: {}", domain, e.compact()), &e);
-        }
-        return (None, String::new());
-    }
-
-    clear_cfproxy_429_cooldown(&base_domain);
-    if !resolved_ip.is_empty() {
-        ldebug!(" CF ok {} via {}", domain, resolved_ip);
-    } else {
-        ldebug!(" CF ok {} via hostname", domain);
-    }
-    (ws, base_domain)
-}
 
 // Только устанавливает WS-соединение через CF, НЕ трогая conn.
 async fn cfproxy_acquire_ws(
     dc: i32,
     is_media: bool,
     ws_path: &str,
-    cancel_token: &CancellationToken,
+    label: &str,
 ) -> Option<(RawWebSocket, String)> {
-    let (enabled, domains) = {
+    let (enabled, has_domains) = {
         let cfg = CFPROXY.read();
-        (
-            CFPROXY_ENABLED.load(Ordering::Relaxed),
-            cfg.domains.clone(),
-        )
+        (CFPROXY_ENABLED.load(Ordering::Relaxed), !cfg.domains.is_empty())
     };
-    if !enabled || domains.is_empty() {
+    if !enabled || !has_domains {
         return None;
     }
 
     let ordered = crate::balancer::BALANCER.read().get_domains_for_dc(dc);
-    if ordered.is_empty() {
+    let targets: Vec<crate::cf_routes::Target> = ordered
+        .iter()
+        .map(|d| crate::cfproxy::cf_domain_key(d))
+        .filter(|d| !d.is_empty())
+        .filter(|d| cfproxy_429_cooldown_remaining(d) == Duration::ZERO)
+        .map(|d| crate::cf_routes::Target { host: format!("kws{}.{}", dc, d), key: d })
+        .collect();
+    if targets.is_empty() {
         return None;
     }
 
     let m_tag = if is_media { " media" } else { "" };
-    ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, ordered.len());
-
-    let mut ws: Option<RawWebSocket> = None;
-    let mut chosen_domain = String::new();
-
-    if !ordered.is_empty() && !ordered[0].is_empty() {
-        let (w, d) = try_cfproxy_base_domain(dc, &ordered[0], ws_path).await;
-        ws = w;
-        chosen_domain = d;
+    ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, targets.len());
+    let what = format!("DC{}{} CF proxy", dc, m_tag);
+    let (ws, target, _secure) =
+        crate::cf_routes::race(&targets, ws_path, crate::cf_routes::GROUP_CF, label, &what, false)
+            .await?;
+    clear_cfproxy_429_cooldown(&target.key);
+    if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &target.key) {
+        linfo!(" CF домен для DC{} -> {}", dc, target.key);
     }
-
-    if ws.is_none() && ordered.len() > 1 {
-        let remaining_domains: Vec<String> = ordered[1..].to_vec();
-        let sem = Arc::new(tokio::sync::Semaphore::new(CFPROXY_FALLBACK_PARALLEL));
-        let mut handles = Vec::new();
-        for bd in remaining_domains {
-            let sem = sem.clone();
-            let cancel = cancel_token.clone();
-            let ws_path = ws_path.to_string();
-            handles.push(tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    r = async {
-                        let _p = sem.acquire().await.ok()?;
-                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
-                        w.map(|ws| (ws, d))
-                    } => r,
-                }
-            }));
-        }
-        for h in handles {
-            if let Ok(Some((w, d))) = h.await {
-                if ws.is_none() {
-                    ws = Some(w);
-                    chosen_domain = d;
-                } else {
-                    tokio::spawn(async move {
-                        w.close().await;
-                    });
-                }
-            }
-        }
-    }
-
-    match ws {
-        Some(w) => {
-            if !chosen_domain.is_empty() {
-                if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain) {
-                    linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
-                }
-            }
-            Some((w, chosen_domain))
-        }
-        None => {
-            lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
-            None
-        }
-    }
+    Some((ws, target.key))
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,39 +1286,28 @@ where
             );
             Some(ws)
         } else {
-            let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
             let query = format!("dst={}&dc={}", fallback_dst, dc);
             let path = format!("/apiws?{}", query);
-            let mut found = None;
-            for worker_domain in pools.cf_worker.available_domains(worker_domains.clone()).await {
-                linfo!(
-                    "[{}] DC{}{} -> trying CF worker {} for {}",
-                    label, dc, m_tag, worker_domain, fallback_dst
-                );
-                match ws_connect_full_opts(
-                    &worker_domain,
-                    &worker_domain,
-                    &path,
-                    10.0,
-                    None,
-                    Some(secure),
-                )
-                .await
-                {
-                    Ok(ws) => {
-                        found = Some(ws);
-                        break;
-                    }
-                    Err(exc) => {
-                        pools.cf_worker.report_failure(&worker_domain, &exc).await;
-                        lwarn!(
-                            "[{}] DC{}{} CF worker {} failed: {}",
-                            label, dc, m_tag, worker_domain, exc.compact()
-                        );
-                    }
-                }
-            }
-            found
+            let candidates = pools.cf_worker.available_domains(worker_domains.clone()).await;
+            linfo!(
+                "[{}] DC{}{} -> trying CF worker ({} domain(s)) for {}",
+                label, dc, m_tag, candidates.len(), fallback_dst
+            );
+            let targets: Vec<crate::cf_routes::Target> = candidates
+                .into_iter()
+                .map(|d| crate::cf_routes::Target { key: d.clone(), host: d })
+                .collect();
+            let what = format!("DC{}{} CF worker", dc, m_tag);
+            crate::cf_routes::race(
+                &targets,
+                &path,
+                crate::cf_routes::GROUP_WORKER,
+                &label,
+                &what,
+                false,
+            )
+            .await
+            .map(|(ws, _, _)| ws)
         };
         if let Some(ws) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
@@ -1447,7 +1337,7 @@ where
     // Шаг 2: cf-ws (без halves).
     if use_cf {
         if let Some((ws, _chosen_domain)) =
-            cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
+            cfproxy_acquire_ws(dc, is_media, ws_path, &label).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
@@ -2164,8 +2054,13 @@ pub async fn run_proxy(
             CF_WORKER_DOMAINS.read().join(", ")
         );
     }
-    if DISABLE_SECURE.load(Ordering::Relaxed) {
-        linfo!("  No secure:     enabled (port 80 for CF proxy/worker)");
+    linfo!(
+        "  CF режим:      {}{}",
+        if DISABLE_SECURE.load(Ordering::Relaxed) { "порт 80" } else { "TLS 443" },
+        if CF_AUTO_MODE.load(Ordering::Relaxed) { ", при отказе пробуется второй порт" } else { "" }
+    );
+    if CF_DPI_SPLIT.load(Ordering::Relaxed) {
+        linfo!("  CF DPI split:  enabled");
     }
     if !FAKE_TLS_DOMAIN.read().is_empty() {
         linfo!("  Fake TLS:      {}", FAKE_TLS_DOMAIN.read().clone());

@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -101,6 +103,150 @@ static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
 static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG.clone());
 
 // ---------------------------------------------------------------------------
+// DpiStream: TCP-поток, который режет первый TLS-рекорд (ClientHello) на два
+// рекорда посередине SNI и отправляет их отдельными сегментами. Обычный DPI
+// разбирает только первый рекорд/сегмент и не видит имя целиком. Для сервера
+// это штатная фрагментация TLS (RFC 8446 §5.1), Cloudflare её принимает.
+// Включается только для CF-маршрутов; прямые соединения к Telegram не трогаем.
+// ---------------------------------------------------------------------------
+
+pub struct DpiStream {
+    inner: TcpStream,
+    split_sni: Option<Vec<u8>>,
+    queue: std::collections::VecDeque<(Vec<u8>, usize)>,
+}
+
+impl DpiStream {
+    pub fn new(inner: TcpStream, split_sni: Option<&str>) -> Self {
+        DpiStream {
+            inner,
+            split_sni: split_sni.map(|s| s.as_bytes().to_vec()),
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while let Some((chunk, off)) = self.queue.front_mut() {
+            while *off < chunk.len() {
+                match Pin::new(&mut self.inner).poll_write(cx, &chunk[*off..]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    }
+                    Poll::Ready(Ok(n)) => *off += n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            self.queue.pop_front();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Делит первый TLS handshake-рекорд из `buf` на два рекорда.
+/// Возвращает None, если в начале буфера нет целого handshake-рекорда.
+pub fn split_tls_record(buf: &[u8], sni: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < 6 || buf[0] != 0x16 || buf[1] != 0x03 {
+        return None;
+    }
+    let len = ((buf[3] as usize) << 8) | buf[4] as usize;
+    if len < 2 || buf.len() < 5 + len {
+        return None;
+    }
+    let payload = &buf[5..5 + len];
+    let at = if sni.is_empty() {
+        None
+    } else {
+        payload.windows(sni.len()).position(|w| w == sni)
+    };
+    let k = match at {
+        Some(pos) => pos + 1 + sni.len() / 2,
+        None => 1,
+    }
+    .clamp(1, len - 1);
+    let rec = |part: &[u8]| {
+        let mut v = Vec::with_capacity(5 + part.len());
+        v.extend_from_slice(&[buf[0], buf[1], buf[2], (part.len() >> 8) as u8, part.len() as u8]);
+        v.extend_from_slice(part);
+        v
+    };
+    let mut out = vec![rec(&payload[..k]), rec(&payload[k..])];
+    if buf.len() > 5 + len {
+        out.push(buf[5 + len..].to_vec());
+    }
+    Some(out)
+}
+
+impl AsyncRead for DpiStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // Хвост ClientHello должен уйти раньше, чем мы начнём ждать ответ.
+        if !this.queue.is_empty() {
+            if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
+                return Poll::Ready(Err(e));
+            }
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DpiStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if let Some(sni) = this.split_sni.take() {
+            if let Some(parts) = split_tls_record(buf, &sni) {
+                for part in parts {
+                    this.queue.push_back((part, 0));
+                }
+                if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
+                    return Poll::Ready(Err(e));
+                }
+                return Poll::Ready(Ok(buf.len()));
+            }
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(cx),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
+/// Делит HTTP-запрос на два куска посередине значения Host.
+pub fn split_http_request(req: &[u8]) -> (usize, bool) {
+    let needle = b"\r\nHost: ";
+    match req.windows(needle.len()).position(|w| w == needle) {
+        Some(pos) => (pos + needle.len() + 2, true),
+        None => (0, false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WsHandshakeError
 // ---------------------------------------------------------------------------
 
@@ -178,12 +324,12 @@ impl From<std::io::Error> for WsError {
 // ---------------------------------------------------------------------------
 
 enum WsReader {
-    Tls(BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>),
+    Tls(BufReader<tokio::io::ReadHalf<TlsStream<DpiStream>>>),
     Plain(BufReader<tokio::io::ReadHalf<TcpStream>>),
 }
 
 enum WsWriter {
-    Tls(tokio::io::WriteHalf<TlsStream<TcpStream>>),
+    Tls(tokio::io::WriteHalf<TlsStream<DpiStream>>),
     Plain(tokio::io::WriteHalf<TcpStream>),
 }
 
@@ -613,8 +759,8 @@ fn server_name(domain: &str) -> ServerName<'static> {
 
 // Типизированный handshake: возвращает готовый RawWebSocket без type-erasure.
 async fn handshake_tls(
-    read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
-    mut write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    read_half: tokio::io::ReadHalf<TlsStream<DpiStream>>,
+    mut write_half: tokio::io::WriteHalf<TlsStream<DpiStream>>,
     domain: &str,
     path: &str,
     timeout: Duration,
@@ -658,6 +804,7 @@ async fn handshake_plain(
     domain: &str,
     path: &str,
     timeout: Duration,
+    split: bool,
 ) -> Result<RawWebSocket, WsError> {
     let mut ws_key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut ws_key_bytes);
@@ -666,7 +813,20 @@ async fn handshake_plain(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n\r\n",
         path, domain, ws_key
     );
-    match tokio::time::timeout(timeout, write_half.write_all(req.as_bytes())).await {
+    let bytes = req.as_bytes();
+    let (cut, do_split) = if split { split_http_request(bytes) } else { (0, false) };
+    let write = async {
+        if do_split && cut > 0 && cut < bytes.len() {
+            // Два отдельных сегмента (TCP_NODELAY): Host не попадает в первый целиком.
+            write_half.write_all(&bytes[..cut]).await?;
+            write_half.flush().await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            write_half.write_all(&bytes[cut..]).await
+        } else {
+            write_half.write_all(bytes).await
+        }
+    };
+    match tokio::time::timeout(timeout, write).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(WsError::Io(e)),
         Err(_) => return Err(WsError::Timeout),
@@ -784,14 +944,39 @@ pub async fn ws_connect_once_full(
     sni: Option<&str>,
     secure: bool,
 ) -> Result<RawWebSocket, WsError> {
+    ws_connect_inner(dial_addr, domain, path, timeout, sni, secure, false).await
+}
+
+/// Подключение для CF-прокси / CF-worker: явный режим (443 TLS или 80) и,
+/// если включено CF_DPI_SPLIT, разбиение первого пакета.
+pub async fn ws_connect_cf(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+    secure: bool,
+) -> Result<RawWebSocket, WsError> {
+    let dpi = CF_DPI_SPLIT.load(Ordering::Relaxed);
+    ws_connect_inner(dial_addr, domain, path, timeout, None, secure, dpi).await
+}
+
+async fn ws_connect_inner(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+    sni: Option<&str>,
+    secure: bool,
+    dpi: bool,
+) -> Result<RawWebSocket, WsError> {
     if dial_addr.is_empty() {
         return Err(WsError::Other("empty dial address".to_string()));
     }
     let path = if path.is_empty() { WS_PATH } else { path };
-    let target_addr = if secure {
-        format!("{}:443", dial_addr)
-    } else {
-        format!("{}:80", dial_addr)
+    let port = ws_port(secure);
+    let target_addr = match dial_addr.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{}]:{}", dial_addr, port),
+        Err(_) => format!("{}:{}", dial_addr, port),
     };
 
     let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
@@ -803,7 +988,7 @@ pub async fn ws_connect_once_full(
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);
-        return handshake_plain(read_half, write_half, domain, path, timeout).await;
+        return handshake_plain(read_half, write_half, domain, path, timeout, dpi).await;
     }
 
     let sni_name = sni.unwrap_or(domain);
@@ -815,6 +1000,7 @@ pub async fn ws_connect_once_full(
     };
     let connector = TlsConnector::from(cfg);
     let sni_server = server_name(sni_name);
+    let raw_conn = DpiStream::new(raw_conn, if dpi { Some(sni_name) } else { None });
 
     let handshake_timeout = ws_handshake_timeout(timeout);
     let tls_conn =

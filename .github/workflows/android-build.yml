@@ -1,0 +1,171 @@
+name: Android Build & Release
+
+# Неофициальная сборка с исправлением CF-маршрутов (cf-fix).
+# Основа — удалённый автором workflow из коммита 7a3851e^.
+#
+# Подпись: задайте секреты ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+# ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD. Без них APK подписывается
+# одноразовым ключом: ставится, но следующая сборка не встанет поверх
+# (другая подпись) — придётся удалять и ставить заново.
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: 'Create GitHub Release?'
+        type: boolean
+        required: true
+        default: false
+      version:
+        description: 'Release tag (e.g. v1.2.3.1-cf)'
+        required: false
+        default: 'v1.2.3.1-cf'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 27.0.12077973
+  JAVA_VERSION: '17'
+
+jobs:
+  rust-test:
+    name: Rust tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test
+        run: cargo test --lib --locked
+
+  build:
+    name: Native libs + APK
+    runs-on: windows-latest
+    needs: rust-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install platform, build-tools and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        shell: bash
+        run: cargo install cargo-ndk --locked
+
+      - name: Build native libs (arm64-v8a, armeabi-v7a)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a --platform 24 -o app/src/main/jniLibs build --release --locked
+          cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release --locked
+          ls -la app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
+
+      - name: Prepare signing key
+        shell: pwsh
+        run: |
+          if (Test-Path local.properties) { Remove-Item local.properties -Force }
+          if ([string]::IsNullOrEmpty($env:KEYSTORE_B64)) {
+            Write-Output "::warning::No keystore secrets - signing with a one-off key. Next build will NOT install over this one."
+            $pass = [guid]::NewGuid().ToString("N")
+            keytool -genkeypair -v -keystore release.keystore -alias tgwsproxy `
+              -keyalg RSA -keysize 2048 -validity 10000 `
+              -storepass $pass -keypass $pass -dname "CN=TG WS Proxy unofficial"
+            $alias = "tgwsproxy"; $kpass = $pass; $spass = $pass
+          } else {
+            [IO.File]::WriteAllBytes("release.keystore", [Convert]::FromBase64String($env:KEYSTORE_B64))
+            $alias = $env:KEY_ALIAS; $kpass = $env:KEY_PASS; $spass = $env:KEYSTORE_PASS
+          }
+          @(
+            "KEYSTORE_FILE=../release.keystore",
+            "KEYSTORE_PASSWORD=$spass",
+            "KEY_ALIAS=$alias",
+            "KEY_PASSWORD=$kpass"
+          ) | Out-File -FilePath local.properties -Encoding ascii
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Build release APKs
+        shell: pwsh
+        run: .\gradlew.bat assembleRelease --no-daemon
+
+      - name: Collect APKs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $map = @{ 'universal' = 'universal'; 'arm64' = 'v8a-minsdk24'; 'arm32' = 'v7a-minsdk21' }
+          foreach ($f in $map.Keys) {
+            $src = Get-ChildItem "app\build\outputs\apk\$f\release\*.apk" | Select-Object -First 1
+            if ($null -eq $src) { throw "APK not found for flavor $f" }
+            Copy-Item $src.FullName "dist\tg-ws-proxy-android-1.2.3.1-cf-$($map[$f]).apk"
+          }
+          Get-ChildItem dist\*.apk | ForEach-Object { Write-Output "$($_.Name) [$($_.Length) bytes]" }
+          Get-FileHash dist\*.apk -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Out-File dist\SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-android-apks
+          path: dist/*
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.event.inputs.make_release == 'true') }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-ws-proxy-android-apks
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}
+          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }} (unofficial)
+          body: |
+            Неофициальная сборка amurcanov/tg-ws-proxy-android v1.2.3 + исправление CF-маршрутов после блокировки встроенных доменов 16.11.2026.
+            Подпись отличается от официальной: перед установкой удалите официальное приложение.
+          files: dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

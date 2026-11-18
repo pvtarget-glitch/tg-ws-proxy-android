@@ -5,6 +5,7 @@ pub mod faketls;
 pub mod proxy;
 pub mod ws;
 pub mod balancer;
+pub mod cf_routes;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -81,6 +82,7 @@ pub unsafe extern "C" fn StartProxy(
 
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
+    cf_routes::reset();
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -227,10 +229,13 @@ pub unsafe extern "C" fn SetCfProxyConfig(
 ) {
     CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
     let user_domain = cstr_to_string(c_user_domain);
-    // Поддержка нескольких доменов как --cfproxy-domain (repeatable).
-    let list = coerce_domain_list_str(&user_domain);
+    // В одном поле: свои домены CF-прокси и домены CF-worker
+    // (*.workers.dev или с префиксом worker:). UI отдельного поля для
+    // воркера не имеет, а SetCfWorkerDomains из приложения не вызывается.
+    let (list, workers) = cf_routes::split_user_domains(&user_domain);
+    *CF_WORKER_DOMAINS.write() = workers;
     let mut cfg = CFPROXY.write();
-    cfg.user_domain = user_domain.trim().to_string();
+    cfg.user_domain = list.join(",");
     if !list.is_empty() {
         cfg.domains = list.clone();
         cfg.active = list[0].clone();

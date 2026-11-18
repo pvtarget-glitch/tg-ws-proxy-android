@@ -86,6 +86,30 @@ pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
+// CF-маршруты: автоматически пробовать второй режим (443 <-> 80), если основной
+// не отвечает, и резать первый пакет (ClientHello / HTTP Host) против DPI.
+pub static CF_AUTO_MODE: AtomicBool = AtomicBool::new(true);
+pub static CF_DPI_SPLIT: AtomicBool = AtomicBool::new(true);
+
+#[cfg(not(test))]
+pub fn ws_port(secure: bool) -> u16 {
+    if secure { 443 } else { 80 }
+}
+
+// В тестах порты подменяются, чтобы поднимать «Cloudflare» на непривилегированных портах.
+#[cfg(test)]
+pub static TEST_PORT_TLS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(443);
+#[cfg(test)]
+pub static TEST_PORT_PLAIN: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+#[cfg(test)]
+pub fn ws_port(secure: bool) -> u16 {
+    if secure {
+        TEST_PORT_TLS.load(Ordering::Relaxed)
+    } else {
+        TEST_PORT_PLAIN.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct Cfproxy429State {
     pub until: Option<Instant>,

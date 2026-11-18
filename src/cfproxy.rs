@@ -42,6 +42,14 @@ pub fn decode_cf_domain(s: &str) -> String {
     out
 }
 
+/// Ключ уже готового домена из пула (встроенные домены к этому моменту
+/// расшифрованы). Пользовательские домены НЕ прогоняются через
+/// normalize_cf_domain: та превращала любой *.com в *.co.uk, а остальные
+/// зоны выбрасывала, и свой CF-домен на Android не работал вовсе.
+pub fn cf_domain_key(s: &str) -> String {
+    crate::cf_routes::clean_domain(s)
+}
+
 pub fn normalize_cf_domain(s: &str) -> String {
     let mut decoded = decode_cf_domain(s.trim()).trim().to_lowercase();
     while decoded.ends_with('.') {
@@ -93,7 +101,7 @@ pub fn clear_cfproxy_429_cooldowns() {
 }
 
 pub fn clear_cfproxy_429_cooldown(domain: &str) {
-    let d = normalize_cf_domain(domain);
+    let d = cf_domain_key(domain);
     if d.is_empty() {
         return;
     }
@@ -147,7 +155,7 @@ pub fn next_cfproxy_429_cooldown_delay(prev: &Cfproxy429State, retry_after: Dura
 }
 
 pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
-    let d = normalize_cf_domain(domain);
+    let d = cf_domain_key(domain);
     if d.is_empty() {
         return;
     }
@@ -175,7 +183,7 @@ pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
 }
 
 pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
-    let d = normalize_cf_domain(domain);
+    let d = cf_domain_key(domain);
     if d.is_empty() {
         return Duration::ZERO;
     }
@@ -279,10 +287,12 @@ pub fn init_cfproxy_domains() {
 
     let mut cfg = CFPROXY.write();
     if !cfg.user_domain.is_empty() {
-        let ud = cfg.user_domain.clone();
-        cfg.domains = vec![ud.clone()];
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
-        return;
+        let (user, _) = crate::cf_routes::split_user_domains(&cfg.user_domain);
+        if !user.is_empty() {
+            cfg.domains = user;
+            crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+            return;
+        }
     }
 
     if !cached.is_empty() {
