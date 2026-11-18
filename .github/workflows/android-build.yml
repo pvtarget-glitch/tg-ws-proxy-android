@@ -17,9 +17,9 @@ on:
         required: true
         default: false
       version:
-        description: 'Release tag (e.g. v1.2.3.1-cf)'
+        description: 'Release tag (e.g. v1.2.3.2-cf)'
         required: false
-        default: 'v1.2.3.1-cf'
+        default: 'v1.2.3.2-cf'
   push:
     tags: ['v*']
 
@@ -128,14 +128,19 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:INPUT_TAG }
+          if ([string]::IsNullOrEmpty($tag)) { $tag = 'dev' }
+          $ver = $tag.TrimStart('v')
           $map = @{ 'universal' = 'universal'; 'arm64' = 'v8a-minsdk24'; 'arm32' = 'v7a-minsdk21' }
           foreach ($f in $map.Keys) {
             $src = Get-ChildItem "app\build\outputs\apk\$f\release\*.apk" | Select-Object -First 1
             if ($null -eq $src) { throw "APK not found for flavor $f" }
-            Copy-Item $src.FullName "dist\tg-ws-proxy-android-1.2.3.1-cf-$($map[$f]).apk"
+            Copy-Item $src.FullName "dist\tg-ws-proxy-android-$ver-$($map[$f]).apk"
           }
           Get-ChildItem dist\*.apk | ForEach-Object { Write-Output "$($_.Name) [$($_.Length) bytes]" }
           Get-FileHash dist\*.apk -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Out-File dist\SHA256SUMS.txt -Encoding ascii
+        env:
+          INPUT_TAG: ${{ github.event.inputs.version }}
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4

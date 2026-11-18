@@ -656,7 +656,8 @@ impl CfWorkerPool {
             .map(|d| crate::cf_routes::Target { key: d.clone(), host: d })
             .collect();
         let what = format!("DC{} CF worker pool", dc);
-        crate::cf_routes::race(&targets, &path, crate::cf_routes::GROUP_WORKER, "pool", &what, true)
+        let flight = format!("worker:{}", path);
+        crate::cf_routes::connect(&flight, &targets, &path, crate::cf_routes::GROUP_WORKER, "pool", &what, true)
             .await
             .map(|(ws, target, _)| (ws, target.key))
     }
@@ -1229,7 +1230,7 @@ async fn cfproxy_acquire_ws(
     ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, targets.len());
     let what = format!("DC{}{} CF proxy", dc, m_tag);
     let (ws, target, _secure) =
-        crate::cf_routes::race(&targets, ws_path, crate::cf_routes::GROUP_CF, label, &what, false)
+        crate::cf_routes::connect(&format!("cf:{}:{}", dc, ws_path), &targets, ws_path, crate::cf_routes::GROUP_CF, label, &what, false)
             .await?;
     clear_cfproxy_429_cooldown(&target.key);
     if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &target.key) {
@@ -1298,7 +1299,8 @@ where
                 .map(|d| crate::cf_routes::Target { key: d.clone(), host: d })
                 .collect();
             let what = format!("DC{}{} CF worker", dc, m_tag);
-            crate::cf_routes::race(
+            crate::cf_routes::connect(
+                &format!("worker:{}", path),
                 &targets,
                 &path,
                 crate::cf_routes::GROUP_WORKER,

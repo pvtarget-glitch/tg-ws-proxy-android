@@ -16,7 +16,12 @@
 //!     оба режима;
 //!   * если основной режим молчит, через SECOND_MODE_DELAY пробуется второй
 //!     (80 ↔ 443), победивший режим запоминается для группы;
-//!   * если все маршруты недавно отказали, CF пропускается сразу, без ожидания.
+//!   * если все маршруты недавно отказали, CF пропускается сразу, без ожидания;
+//!   * домен, который недавно отвечал, получает фору STICKY_GRACE: на медленном
+//!     канале иначе выигрывал случайный быстрый домен и активный домен «прыгал»;
+//!   * одновременные соединения к одному DC ждут общего перебора и подключаются
+//!     к победителю, а не запускают каждое свой (Telegram открывает по 3-4
+//!     соединения разом, и параллельные переборы забивали узкий канал).
 
 use crate::config::*;
 use crate::ws::{ws_connect_cf, RawWebSocket, WsError};
@@ -48,6 +53,8 @@ pub struct Timing {
     pub max_parallel: usize,
     pub cooldown_initial: Duration,
     pub cooldown_max: Duration,
+    pub sticky_grace: Duration,
+    pub sticky_window: Duration,
 }
 
 impl Timing {
@@ -59,6 +66,8 @@ impl Timing {
         max_parallel: 3,
         cooldown_initial: Duration::from_secs(20),
         cooldown_max: Duration::from_secs(300),
+        sticky_grace: Duration::from_millis(2500),
+        sticky_window: Duration::from_secs(120),
     };
 }
 
@@ -70,6 +79,8 @@ struct Health {
     fails: HashMap<(String, bool), (u32, Instant)>,
     // группа -> режим, который отвечал последним (true = TLS 443)
     preferred: HashMap<&'static str, bool>,
+    // (группа, ключ) -> когда маршрут последний раз ответил
+    last_ok: HashMap<(&'static str, String), Instant>,
 }
 
 static HEALTH: Lazy<Mutex<Health>> = Lazy::new(|| Mutex::new(Health::default()));
@@ -78,6 +89,8 @@ pub fn reset() {
     let mut h = HEALTH.lock();
     h.fails.clear();
     h.preferred.clear();
+    h.last_ok.clear();
+    FLIGHTS.lock().clear();
 }
 
 fn default_secure() -> bool {
@@ -124,8 +137,19 @@ fn mark_failed(key: &str, secure: bool, err: &WsError) {
     }
 }
 
-fn mark_ok(key: &str, secure: bool) {
-    HEALTH.lock().fails.remove(&(key.to_string(), secure));
+fn mark_ok(group: &'static str, key: &str, secure: bool) {
+    let mut h = HEALTH.lock();
+    h.fails.remove(&(key.to_string(), secure));
+    h.last_ok.insert((group, key.to_string()), Instant::now());
+}
+
+fn recently_ok(group: &'static str, key: &str, window: Duration) -> bool {
+    HEALTH
+        .lock()
+        .last_ok
+        .get(&(group, key.to_string()))
+        .map(|t| t.elapsed() < window)
+        .unwrap_or(false)
 }
 
 fn note_winner(group: &'static str, secure: bool, label: &str) {
@@ -222,6 +246,12 @@ pub async fn race(
             if secure == primary {
                 running_primary += 1;
             }
+            // Недавно работавшему маршруту даём фору, прежде чем пробовать другие.
+            let grace = if recently_ok(group, &target.key, t.sticky_window) {
+                t.sticky_grace.max(t.stagger)
+            } else {
+                t.stagger
+            };
             let path = path.to_string();
             let per_try = t.attempt;
             set.spawn(async move {
@@ -233,7 +263,7 @@ pub async fn race(
                 };
                 (target, secure, r)
             });
-            next_start = now + t.stagger;
+            next_start = now + grace;
         }
 
         let queued = !q1.is_empty() || !q2.is_empty();
@@ -264,7 +294,7 @@ pub async fn race(
                 }
                 match result {
                     Ok(ws) => {
-                        mark_ok(&target.key, secure);
+                        mark_ok(group, &target.key, secure);
                         winner = Some((ws, target, secure));
                     }
                     Err(e) => {
@@ -305,6 +335,108 @@ pub async fn race(
             );
             if quiet { ldebug!("{}", msg) } else { lwarn!("{}", msg) }
             None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Общий перебор для одновременных соединений к одному DC
+// ---------------------------------------------------------------------------
+
+type FlightResult = Option<(Target, bool)>;
+
+static FLIGHTS: Lazy<Mutex<HashMap<String, (u64, tokio::sync::watch::Receiver<Option<FlightResult>>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static FLIGHT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct FlightGuard {
+    key: String,
+    id: u64,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut f = FLIGHTS.lock();
+        if f.get(&self.key).map(|(id, _)| *id) == Some(self.id) {
+            f.remove(&self.key);
+        }
+    }
+}
+
+/// Как `race`, но одновременные вызовы с одним `flight` не перебирают
+/// маршруты каждый сам: первый перебирает, остальные ждут его результата и
+/// подключаются к победителю одной попыткой.
+pub async fn connect(
+    flight: &str,
+    targets: &[Target],
+    path: &str,
+    group: &'static str,
+    label: &str,
+    what: &str,
+    quiet: bool,
+) -> Option<(RawWebSocket, Target, bool)> {
+    enum Role {
+        Leader(tokio::sync::watch::Sender<Option<FlightResult>>, FlightGuard),
+        Follower(tokio::sync::watch::Receiver<Option<FlightResult>>),
+    }
+    let role = {
+        let mut f = FLIGHTS.lock();
+        match f.get(flight) {
+            Some((_, rx)) => Role::Follower(rx.clone()),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                let id = FLIGHT_SEQ.fetch_add(1, Ordering::Relaxed);
+                f.insert(flight.to_string(), (id, rx));
+                Role::Leader(tx, FlightGuard { key: flight.to_string(), id })
+            }
+        }
+    };
+
+    match role {
+        Role::Leader(tx, guard) => {
+            let res = race(targets, path, group, label, what, quiet).await;
+            let _ = tx.send(Some(res.as_ref().map(|(_, t, s)| (t.clone(), *s))));
+            drop(guard);
+            res
+        }
+        Role::Follower(mut rx) => {
+            let t = *TIMING.read();
+            let waited = tokio::time::timeout(t.budget + t.attempt, async {
+                loop {
+                    if let Some(r) = rx.borrow().clone() {
+                        return Some(r);
+                    }
+                    if rx.changed().await.is_err() {
+                        return rx.borrow().clone();
+                    }
+                }
+            })
+            .await;
+            match waited {
+                Ok(Some(Some((target, secure)))) => {
+                    let r = tokio::time::timeout(
+                        t.attempt * 2,
+                        attempt(target.host.clone(), path.to_string(), secure, t.attempt),
+                    )
+                    .await
+                    .unwrap_or(Err(WsError::Timeout));
+                    match r {
+                        Ok(ws) => {
+                            mark_ok(group, &target.key, secure);
+                            return Some((ws, target, secure));
+                        }
+                        Err(e) => {
+                            mark_failed(&target.key, secure, &e);
+                            ldebug!("[{}] {}: победитель общего перебора не ответил: {}", label, what, e.compact());
+                        }
+                    }
+                }
+                // Общий перебор только что ничего не нашёл: свой будет тем же.
+                Ok(Some(None)) => return None,
+                // Ведущий отменён или завис — перебираем сами.
+                _ => {}
+            }
+            race(targets, path, group, label, what, quiet).await
         }
     }
 }
@@ -375,7 +507,117 @@ mod tests {
             max_parallel: 3,
             cooldown_initial: Duration::from_secs(20),
             cooldown_max: Duration::from_secs(300),
+            sticky_grace: Duration::from_millis(1000),
+            sticky_window: Duration::from_secs(120),
         }
+    }
+
+    /// Сервер на порту 80 по всем 127.0.0.x: поведение задаётся по адресу,
+    /// на который пришло соединение (None = молчит, Some(d) = 101 через d).
+    async fn per_ip_plain(
+        behaviour: HashMap<String, Option<Duration>>,
+    ) -> Arc<Mutex<HashMap<String, usize>>> {
+        let l = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        TEST_PORT_PLAIN.store(l.local_addr().unwrap().port(), Ordering::SeqCst);
+        // TLS-порт закрыт: второй режим сразу получает отказ.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        TEST_PORT_TLS.store(closed.local_addr().unwrap().port(), Ordering::SeqCst);
+        drop(closed);
+        let hits: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let h2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let ip = s.local_addr().unwrap().ip().to_string();
+                *h2.lock().entry(ip.clone()).or_insert(0) += 1;
+                let b = behaviour.get(&ip).cloned().flatten();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    match b {
+                        None => tokio::time::sleep(Duration::from_secs(30)).await,
+                        Some(d) => {
+                            tokio::time::sleep(d).await;
+                            let _ = s.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").await;
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                });
+            }
+        });
+        hits
+    }
+
+    fn ip_targets(ips: &[&str]) -> Vec<Target> {
+        ips.iter()
+            .map(|ip| Target { key: format!("{}.example", ip.replace('.', "-")), host: ip.to_string() })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_connections_share_one_race() {
+        let _g = SERIAL.lock().await;
+        setup(true);
+        CF_AUTO_MODE.store(false, Ordering::SeqCst);
+        let ips = ["127.0.0.11", "127.0.0.12", "127.0.0.13", "127.0.0.14", "127.0.0.15"];
+        let mut b = HashMap::new();
+        for ip in &ips[..4] { b.insert(ip.to_string(), None); }
+        b.insert(ips[4].to_string(), Some(Duration::from_millis(10)));
+        let hits = per_ip_plain(b).await;
+        let tg = ip_targets(&ips);
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let tg = tg.clone();
+            tasks.push(tokio::spawn(async move {
+                connect("cf:2:/apiws", &tg, "/apiws", GROUP_CF, &format!("c{}", i), "CF", true).await
+                    .map(|(_, t, _)| t.key)
+            }));
+        }
+        let mut keys = Vec::new();
+        for t in tasks { keys.push(t.await.unwrap().expect("все должны подключиться")); }
+        assert!(keys.iter().all(|k| k == &tg[4].key), "{:?}", keys);
+        let h = hits.lock().clone();
+        let dead: usize = ips[..4].iter().map(|ip| h.get(*ip).copied().unwrap_or(0)).sum();
+        // Один общий перебор трогает каждый мёртвый домен не больше раза;
+        // четыре отдельных перебора дали бы до 16 попыток.
+        assert!(dead <= 4, "попыток к мёртвым доменам: {}", dead);
+        assert_eq!(h.get(ips[4]).copied().unwrap_or(0), 4);
+        CF_AUTO_MODE.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn recently_good_domain_gets_head_start() {
+        let _g = SERIAL.lock().await;
+        setup(true);
+        CF_AUTO_MODE.store(false, Ordering::SeqCst);
+        {
+            let mut t = TIMING.write();
+            t.attempt = Duration::from_millis(900);
+        }
+        let ips = ["127.0.0.21", "127.0.0.22"];
+        let mut b = HashMap::new();
+        b.insert(ips[0].to_string(), Some(Duration::from_millis(400))); // рабочий, но медленный
+        b.insert(ips[1].to_string(), Some(Duration::from_millis(5)));   // быстрый
+        let _hits = per_ip_plain(b).await;
+        let tg = ip_targets(&ips);
+
+        // Без истории побеждает быстрый.
+        let r = race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await.unwrap();
+        assert_eq!(r.1.key, tg[1].key);
+
+        // Медленный недавно работал: он получает фору и остаётся активным.
+        reset();
+        *TIMING.write() = Timing { attempt: Duration::from_millis(900), ..fast_timing() };
+        mark_ok(GROUP_CF, &tg[0].key, false);
+        let r = race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await.unwrap();
+        assert_eq!(r.1.key, tg[0].key);
+        CF_AUTO_MODE.store(true, Ordering::SeqCst);
     }
 
     #[derive(Clone, Copy, PartialEq)]
