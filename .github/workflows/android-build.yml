@@ -66,16 +66,20 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - name: Setup Android SDK
+      # На Windows sdkmanager — это .bat и из bash не вызывается,
+      # поэтому пакеты ставит сам setup-android.
+      - name: Setup Android SDK, platform, build-tools and NDK
         uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.0.12077973'
 
-      - name: Install platform, build-tools and NDK
+      - name: Export NDK path
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          NDK="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          test -d "$NDK" || { echo "NDK not found: $NDK"; ls "${ANDROID_HOME}/ndk" || true; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
       - name: Install cargo-ndk
         shell: bash
