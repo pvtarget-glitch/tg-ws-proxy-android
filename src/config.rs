@@ -43,6 +43,8 @@ pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
 pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+pub const BRIDGE_PING_CHECK: Duration = Duration::from_secs(5);
+pub const BRIDGE_PING_IDLE: Duration = Duration::from_secs(20);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;

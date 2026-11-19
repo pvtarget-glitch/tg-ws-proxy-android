@@ -83,6 +83,7 @@ pub unsafe extern "C" fn StartProxy(
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
     cf_routes::reset();
+    proxy::reset_tcp_port_pref();
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {

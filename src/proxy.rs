@@ -817,16 +817,22 @@ pub async fn bridge_ws<R, W>(
     let la_ping = last_activity.clone();
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
+    // Было: тик раз в 30 с и ping только при простое > 30 с, то есть первый
+    // ping уходил примерно на 60-й секунде — когда сервер уже закрывал
+    // простаивающее соединение (upstream: ws_close на 60 с). Теперь проверка
+    // раз в BRIDGE_PING_CHECK, ping при простое от BRIDGE_PING_IDLE.
     let ping_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL);
+        let mut interval = tokio::time::interval(BRIDGE_PING_CHECK);
         interval.tick().await;
+        let mut last_ping = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = cancel_token_ping.cancelled() => return,
                 _ = cancel_ping.notified() => return,
                 _ = interval.tick() => {
                     let idle = la_ping.lock().await.elapsed();
-                    if idle > BRIDGE_PING_INTERVAL {
+                    if idle >= BRIDGE_PING_IDLE && last_ping.elapsed() >= BRIDGE_PING_IDLE {
+                        last_ping = tokio::time::Instant::now();
                         if ws_ping.send_ping().await.is_err() {
                             cancel_ping.notify_waiters();
                             return;
@@ -1146,6 +1152,118 @@ pub async fn bridge_tcp_stream(
 // TCP fallback — порт bridge._tcp_fallback
 // ---------------------------------------------------------------------------
 
+// Telegram принимает MTProto и на 443, и на 80. Раньше Android ходил только
+// на один порт (80 при DISABLE_SECURE), и там, где режут именно его, прямой
+// путь пропадал. Теперь пробуем оба лесенкой и запоминаем рабочий для адреса.
+static TCP_PORT_PREF: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<String, u16>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+pub const TCP_FALLBACK_PORTS: [u16; 2] = [443, 80];
+
+#[cfg(not(test))]
+const TCP_SECOND_PORT_DELAY: Duration = Duration::from_millis(1000);
+#[cfg(test)]
+const TCP_SECOND_PORT_DELAY: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(600);
+
+#[cfg(test)]
+pub static TCP_TEST_PORT_MAP: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<u16, u16>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn tcp_real_port(port: u16) -> u16 {
+    #[cfg(test)]
+    {
+        if let Some(p) = TCP_TEST_PORT_MAP.lock().get(&port) {
+            return *p;
+        }
+    }
+    port
+}
+
+pub fn reset_tcp_port_pref() {
+    TCP_PORT_PREF.lock().clear();
+}
+
+pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Option<TcpStream> {
+    let first = TCP_PORT_PREF.lock().get(dst).copied().unwrap_or(preferred);
+    let mut order: Vec<u16> = vec![first];
+    for p in TCP_FALLBACK_PORTS.iter().copied().chain(std::iter::once(preferred)) {
+        if !order.contains(&p) {
+            order.push(p);
+        }
+    }
+
+    let mut set: tokio::task::JoinSet<(u16, std::io::Result<TcpStream>)> = tokio::task::JoinSet::new();
+    let deadline = tokio::time::Instant::now() + TCP_CONNECT_TIMEOUT + TCP_SECOND_PORT_DELAY;
+    let mut pending = order.into_iter();
+    let spawn = |set: &mut tokio::task::JoinSet<(u16, std::io::Result<TcpStream>)>, port: u16| {
+        let addr = if dst.contains(':') {
+            format!("[{}]:{}", dst, tcp_real_port(port))
+        } else {
+            format!("{}:{}", dst, tcp_real_port(port))
+        };
+        set.spawn(async move {
+            let r = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+            };
+            (port, r)
+        });
+    };
+    if let Some(p) = pending.next() {
+        spawn(&mut set, p);
+    }
+    let mut next_at = tokio::time::Instant::now() + TCP_SECOND_PORT_DELAY;
+    let mut errors: Vec<String> = Vec::new();
+
+    loop {
+        let has_more = pending.len() > 0;
+        if set.is_empty() && !has_more {
+            break;
+        }
+        let wake = if has_more { next_at.min(deadline) } else { deadline };
+        if set.is_empty() {
+            tokio::time::sleep_until(wake).await;
+        }
+        tokio::select! {
+            joined = set.join_next(), if !set.is_empty() => {
+                let Some(Ok((port, r))) = joined else { continue };
+                match r {
+                    Ok(stream) => {
+                        let prev = TCP_PORT_PREF.lock().insert(dst.to_string(), port);
+                        if port != preferred && prev != Some(port) {
+                            linfo!("[{}] TCP fallback: {}:{} отвечает, порт {} — нет", label, dst, port, preferred);
+                        }
+                        set.abort_all();
+                        return Some(stream);
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", port, if e.kind() == std::io::ErrorKind::TimedOut { "timeout".to_string() } else { e.to_string() }));
+                        // отказ — следующий порт сразу
+                        next_at = tokio::time::Instant::now();
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+        if tokio::time::Instant::now() >= next_at {
+            if let Some(p) = pending.next() {
+                spawn(&mut set, p);
+                next_at = tokio::time::Instant::now() + TCP_SECOND_PORT_DELAY;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    set.abort_all();
+    lwarn!("[{}] TCP fallback to {} failed: {}", label, dst, if errors.is_empty() { "timeout".to_string() } else { errors.join(", ") });
+    None
+}
+
 pub async fn tcp_fallback<R, W>(
     conn_read: R,
     conn_write: W,
@@ -1160,19 +1278,10 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    let addr = format!("{}:{}", dst, port);
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
+    let mut remote = match tcp_connect_any_port(dst, port, &label).await {
+        Some(r) => r,
+        None => return false,
+    };
     let _ = remote.set_nodelay(true);
 
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
@@ -2131,4 +2240,81 @@ pub fn parse_cidr_pool(cidrs_str: &str) -> HashMap<i32, String> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tcp_port_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    static SERIAL: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+    async fn listener() -> (TcpListener, u16) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        (l, p)
+    }
+
+    async fn closed_port() -> u16 {
+        let (l, p) = listener().await;
+        drop(l);
+        p
+    }
+
+    fn map(p443: u16, p80: u16) {
+        let mut m = TCP_TEST_PORT_MAP.lock();
+        m.clear();
+        m.insert(443, p443);
+        m.insert(80, p80);
+        reset_tcp_port_pref();
+    }
+
+    #[tokio::test]
+    async fn closed_443_moves_to_80_immediately_and_remembers_it() {
+        let _g = SERIAL.lock().await;
+        let (l80, p80) = listener().await;
+        map(closed_port().await, p80);
+        let t0 = tokio::time::Instant::now();
+        let s = tcp_connect_any_port("127.0.0.1", 443, "t").await.expect("порт 80 должен ответить");
+        assert_eq!(s.peer_addr().unwrap().port(), p80);
+        assert!(t0.elapsed() < TCP_SECOND_PORT_DELAY, "{:?}", t0.elapsed());
+        assert_eq!(TCP_PORT_PREF.lock().get("127.0.0.1").copied(), Some(80));
+        drop(l80);
+    }
+
+    #[tokio::test]
+    async fn open_443_is_used_and_80_is_not_touched() {
+        let _g = SERIAL.lock().await;
+        let (l443, p443) = listener().await;
+        let (l80, p80) = listener().await;
+        map(p443, p80);
+        let s = tcp_connect_any_port("127.0.0.1", 443, "t").await.unwrap();
+        assert_eq!(s.peer_addr().unwrap().port(), p443);
+        let touched = tokio::time::timeout(Duration::from_millis(250), l80.accept()).await;
+        assert!(touched.is_err(), "к порту 80 не должны были подключаться");
+        drop(l443);
+    }
+
+    #[tokio::test]
+    async fn remembered_port_goes_first() {
+        let _g = SERIAL.lock().await;
+        let (l443, p443) = listener().await;
+        let (_l80, p80) = listener().await;
+        map(p443, p80);
+        TCP_PORT_PREF.lock().insert("127.0.0.1".into(), 80);
+        let s = tcp_connect_any_port("127.0.0.1", 443, "t").await.unwrap();
+        assert_eq!(s.peer_addr().unwrap().port(), p80);
+        let touched = tokio::time::timeout(Duration::from_millis(250), l443.accept()).await;
+        assert!(touched.is_err(), "к 443 не должны были подключаться");
+    }
+
+    #[tokio::test]
+    async fn both_closed_fails_fast() {
+        let _g = SERIAL.lock().await;
+        map(closed_port().await, closed_port().await);
+        let t0 = tokio::time::Instant::now();
+        assert!(tcp_connect_any_port("127.0.0.1", 80, "t").await.is_none());
+        assert!(t0.elapsed() < TCP_SECOND_PORT_DELAY, "{:?}", t0.elapsed());
+    }
 }
