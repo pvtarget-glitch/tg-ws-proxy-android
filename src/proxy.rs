@@ -1380,6 +1380,18 @@ async fn cfproxy_acquire_ws(
 // добываются БЕЗ halves, затем halves уходят в bridge/tcp.
 // ---------------------------------------------------------------------------
 
+/// Меняет номер DC в уже зашифрованном relay_init. Байты DC зашифрованы
+/// AES-CTR, поэтому достаточно XOR со (старое ^ новое): ключи и состояние
+/// шифра потока не меняются.
+pub fn relay_init_with_dc(init: &[u8], old_dc_idx: i16, new_dc_idx: i16) -> Vec<u8> {
+    let mut out = init.to_vec();
+    let old = (old_dc_idx as u16).to_le_bytes();
+    let new = (new_dc_idx as u16).to_le_bytes();
+    out[DC_IDX_POS] ^= old[0] ^ new[0];
+    out[DC_IDX_POS + 1] ^= old[1] ^ new[1];
+    out
+}
+
 pub async fn do_fallback<R, W>(
     pools: &ProxyPools,
     conn_read: R,
@@ -1472,13 +1484,24 @@ where
 
     // Шаг 2: cf-ws (без halves).
     if use_cf {
+        linfo!("[{}] DC{}{} -> trying CF proxy", label, dc, m_tag);
         if let Some((ws, _chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &label).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
 
-            if ws.send(relay_init).await.is_ok() {
+            // CF-домен ведёт kwsN на основной IP DC: отдельного медиа-адреса
+            // там нет, и основной DC отвечает на медиа-соединение (DC = -N)
+            // транспортной ошибкой (8 байт за 0.2 с). Поэтому через CF медиа
+            // идут как обычное соединение — как в десктопном HTTP/2-канале,
+            // где медиа-запросы уходят на /api основного DC без пометки.
+            let cf_init = if is_media {
+                relay_init_with_dc(relay_init, -(dc as i16), dc as i16)
+            } else {
+                relay_init.to_vec()
+            };
+            if ws.send(&cf_init).await.is_ok() {
                 bridge_ws(
                     conn_read,
                     conn_write,
@@ -2342,5 +2365,37 @@ mod tcp_port_tests {
         let t0 = tokio::time::Instant::now();
         assert!(tcp_connect_any_port("127.0.0.1", 80, "t").await.is_none());
         assert!(t0.elapsed() < TCP_SECOND_PORT_DELAY, "{:?}", t0.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod relay_init_tests {
+    use super::*;
+
+    #[test]
+    fn dc_flip_keeps_stream_and_changes_only_dc() {
+        // Собираем relay_init так же, как serve_core, для медиа DC2.
+        let mut init = [0u8; 64];
+        for (i, b) in init.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37).wrapping_add(11); }
+        let tail_plain: [u8; 8] = [0xee, 0xee, 0xee, 0xee, 0xfe, 0xff, 0x12, 0x34]; // dc = -2
+        let mut enc = new_aes_ctr(&init[8..40], &init[40..56]);
+        let mut full = init;
+        enc.xor(&mut full);
+        for i in 0..8 {
+            let ks = full[56 + i] ^ init[56 + i];
+            init[56 + i] = tail_plain[i] ^ ks;
+        }
+
+        let flipped = relay_init_with_dc(&init, -2, 2);
+        assert_eq!(&flipped[..60], &init[..60]);
+        assert_eq!(&flipped[62..], &init[62..]);
+
+        // Сервер расшифровывает пакет тем же ключом и видит DC = 2.
+        let mut dec = new_aes_ctr(&flipped[8..40], &flipped[40..56]);
+        let mut plain = flipped.clone();
+        dec.xor(&mut plain);
+        assert_eq!(&plain[56..60], &[0xee, 0xee, 0xee, 0xee]);
+        assert_eq!(i16::from_le_bytes([plain[60], plain[61]]), 2);
+        assert_eq!(&plain[62..64], &[0x12, 0x34]);
     }
 }
