@@ -17,9 +17,9 @@ on:
         required: true
         default: false
       version:
-        description: 'Release tag (e.g. v1.2.3.6-cf)'
+        description: 'Release tag (e.g. v1.2.3.7-cf)'
         required: false
-        default: 'v1.2.3.6-cf'
+        default: 'v1.2.3.7-cf'
   push:
     tags: ['v*']
 

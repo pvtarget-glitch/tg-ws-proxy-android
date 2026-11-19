@@ -120,6 +120,18 @@ pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 pub static CF_AUTO_MODE: AtomicBool = AtomicBool::new(true);
 pub static CF_DPI_SPLIT: AtomicBool = AtomicBool::new(true);
 
+// Медиа (файлы, фото, видео) через CF на Android не проходят: сервер закрывает
+// такие сессии на первых сотнях байт, а клиент Telegram в ответ открывает всё
+// новые соединения, и прямой путь получает отказы (302 / -429). Поэтому по
+// умолчанию медиа идут только прямым путём (пул / свежий WS), без CF.
+pub static CF_MEDIA: AtomicBool = AtomicBool::new(false);
+
+/// Медиа-соединение не должно уходить в CF (и не должно из-за CF-фолбэка
+/// пропускать прямой путь по чёрному списку / cooldown).
+pub fn media_skips_cf(is_media: bool) -> bool {
+    is_media && !CF_MEDIA.load(Ordering::Relaxed)
+}
+
 #[cfg(not(test))]
 pub fn ws_port(secure: bool) -> u16 {
     if secure { 443 } else { 80 }
@@ -653,6 +665,12 @@ pub fn now_monotonic() -> f64 {
 mod auto_dc_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn media_never_goes_through_cf_by_default() {
+        assert!(media_skips_cf(true));
+        assert!(!media_skips_cf(false));
+    }
 
     #[test]
     fn auto_mode_with_cf_gets_direct_dc2_dc4() {

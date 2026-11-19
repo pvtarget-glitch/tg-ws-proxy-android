@@ -1402,11 +1402,22 @@ where
 {
     let m_tag = if is_media { " media" } else { "" };
     let fallback_dst = resolve_fallback_target(dc, is_media, is_test);
-    let use_cf = CFPROXY_ENABLED.load(Ordering::Relaxed) && !is_test;
+    let skip_cf = media_skips_cf(is_media);
+    let use_cf = CFPROXY_ENABLED.load(Ordering::Relaxed) && !is_test && !skip_cf;
     let worker_domains = CF_WORKER_DOMAINS.read().clone();
     let ws_path = ws_path_for(is_test);
     let secure_port = if DISABLE_SECURE.load(Ordering::Relaxed) { 80 } else { 443 };
-    let use_worker = !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test;
+    let use_worker =
+        !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test && !skip_cf;
+    if skip_cf
+        && !is_test
+        && (CFPROXY_ENABLED.load(Ordering::Relaxed) || !worker_domains.is_empty())
+    {
+        linfo!(
+            "[{}] DC{}{} -> CF пропущен (медиа через CF не проходят)",
+            label, dc, m_tag
+        );
+    }
 
     // Шаг 1: worker-ws (без halves) — порт _cfproxy_worker_fallback.
     if use_worker {
@@ -1812,12 +1823,18 @@ async fn serve_core<R, W>(
     };
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || !CF_WORKER_DOMAINS.read().is_empty();
+    // Медиа через CF не ходят — значит, и уводить их с прямого пути из-за
+    // чёрного списка / cooldown некуда: пробуем прямой путь всегда.
+    let media_direct_only = media_skips_cf(is_media) && is_any_cf_fallback;
 
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
     let mut pooled_ws: Option<RawWebSocket> = None;
     let mut use_pooled_direct = false;
-    if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
+    if !dc_configured
+        || (blacklisted && !media_direct_only)
+        || (ip_cooldown_active && is_any_cf_fallback && !media_direct_only)
+    {
         if !dc_configured {
             linfo!("[{}] DC{} not in config -> fallback", label, dc);
         } else {
