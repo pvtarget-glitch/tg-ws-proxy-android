@@ -1,0 +1,35 @@
+name: Sync release notes
+
+# Описание каждого релиза хранится в .github/release-notes/<тег>.md.
+# При изменении этих файлов описания уже выпущенных релизов обновляются.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/release-notes/**'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/release-notes
+      - name: Update release bodies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in .github/release-notes/*.md; do
+            tag="$(basename "$f" .md)"
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$f"
+              echo "updated $tag"
+            else
+              echo "no release $tag yet, skipped"
+            fi
+          done

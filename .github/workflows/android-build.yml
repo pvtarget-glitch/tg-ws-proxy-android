@@ -159,6 +159,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/release-notes
+          path: src
+
+      - name: Release notes for this version
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}
+        run: |
+          f="src/.github/release-notes/${TAG}.md"
+          if [ -f "$f" ]; then
+            cp "$f" release-notes.md
+          else
+            echo "::warning::Нет файла $f — релиз выйдет без описания изменений"
+            printf 'Описание изменений для этой версии не добавлено.\n' > release-notes.md
+          fi
+
       - name: Download APKs
         uses: actions/download-artifact@v4
         with:
@@ -170,9 +188,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}
           name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }} (unofficial)
-          body: |
-            Неофициальная сборка amurcanov/tg-ws-proxy-android v1.2.3 + исправление CF-маршрутов после блокировки встроенных доменов 16.11.2026.
-            Подпись отличается от официальной: перед установкой удалите официальное приложение.
+          body_path: release-notes.md
           files: dist/*
           draft: false
           prerelease: false
