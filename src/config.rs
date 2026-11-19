@@ -16,6 +16,33 @@ pub const DEFAULT_POOL_SZ: i32 = 4;
 
 // proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
 pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
+// Авто-режим (CF включён, адреса DC не заданы): прямой путь DC2/DC4 через
+// AUTO_DIRECT_IP пробуется первым, CF — при отказе. Приложение не
+// перезапускает прокси при смене сети, поэтому cooldown прямого пути и пауза
+// пополнения пула в этом режиме короткие: дома прямой путь вернётся быстро.
+pub static AUTO_DIRECT_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub const AUTO_DIRECT_IP: &str = "149.154.167.220";
+pub const AUTO_DIRECT_DCS: [i32; 2] = [2, 4];
+pub const AUTO_DIRECT_COOLDOWN: f64 = 120.0;
+
+pub fn ip_fail_cooldown() -> f64 {
+    if AUTO_DIRECT_ACTIVE.load(Ordering::Relaxed) { AUTO_DIRECT_COOLDOWN } else { IP_FAIL_COOLDOWN }
+}
+
+pub fn ws_pool_refill_backoff_max() -> f64 {
+    if AUTO_DIRECT_ACTIVE.load(Ordering::Relaxed) { AUTO_DIRECT_COOLDOWN } else { WS_POOL_REFILL_BACKOFF_MAX }
+}
+
+/// Карта DC для авто-режима: если адреса не заданы, а CF включён,
+/// добавляем прямой путь DC2/DC4 (как в десктопной версии по умолчанию).
+pub fn auto_dc_defaults(map: std::collections::HashMap<i32, String>, cf_enabled: bool)
+    -> (std::collections::HashMap<i32, String>, bool) {
+    if !map.is_empty() || !cf_enabled {
+        return (map, false);
+    }
+    let m = AUTO_DIRECT_DCS.iter().map(|dc| (*dc, AUTO_DIRECT_IP.to_string())).collect();
+    (m, true)
+}
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
 pub const WS_FAIL_TIMEOUT: f64 = 2.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
@@ -620,4 +647,30 @@ pub fn now_monotonic() -> f64 {
     use std::time::Instant;
     static START: Lazy<Instant> = Lazy::new(Instant::now);
     START.elapsed().as_secs_f64()
+}
+
+#[cfg(test)]
+mod auto_dc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn auto_mode_with_cf_gets_direct_dc2_dc4() {
+        let (m, auto) = auto_dc_defaults(HashMap::new(), true);
+        assert!(auto);
+        assert_eq!(m.get(&2).map(String::as_str), Some(AUTO_DIRECT_IP));
+        assert_eq!(m.get(&4).map(String::as_str), Some(AUTO_DIRECT_IP));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn manual_map_or_cf_off_is_left_alone() {
+        let mut manual = HashMap::new();
+        manual.insert(2, "1.2.3.4".to_string());
+        let (m, auto) = auto_dc_defaults(manual.clone(), true);
+        assert!(!auto);
+        assert_eq!(m, manual);
+        let (m, auto) = auto_dc_defaults(HashMap::new(), false);
+        assert!(!auto && m.is_empty());
+    }
 }
