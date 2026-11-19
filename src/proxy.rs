@@ -287,6 +287,20 @@ impl WsPool {
 
         if connected > 0 {
             self.report_success(slot.dc, slot.is_media != 0).await;
+            // WS до этого DC реально работает: снимаем блэклист и cooldown,
+            // поставленные по одиночному таймауту/редиректу (было: до
+            // перезапуска / на час).
+            let key = DcKey::new(slot.dc, slot.is_media != 0, false);
+            let unblocked = WS_BLACKLIST.write().remove(&key).is_some();
+            let uncooled = IP_FAIL_UNTIL.write().remove(&target_ip).is_some();
+            DC_FAIL_UNTIL.write().remove(&key);
+            if unblocked || uncooled {
+                linfo!(
+                    "WS pool DC{}{}: WS снова работает, блокировка снята",
+                    slot.dc,
+                    if slot.is_media != 0 { "m" } else { "" }
+                );
+            }
             self.schedule_rotation(slot, target_ip, domains).await;
         } else {
             // Экспоненциальный backoff 1s..3600s как в оригинале.
@@ -1213,11 +1227,16 @@ pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Opt
             (port, r)
         });
     };
-    if let Some(p) = pending.next() {
+    let order_first = pending.next();
+    if let Some(p) = order_first {
         spawn(&mut set, p);
     }
     let mut next_at = tokio::time::Instant::now() + TCP_SECOND_PORT_DELAY;
     let mut errors: Vec<String> = Vec::new();
+    let mut started: Vec<u16> = Vec::new();
+    if let Some(p) = order_first {
+        started.push(p);
+    }
 
     loop {
         let has_more = pending.len() > 0;
@@ -1252,6 +1271,7 @@ pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Opt
         if tokio::time::Instant::now() >= next_at {
             if let Some(p) = pending.next() {
                 spawn(&mut set, p);
+                started.push(p);
                 next_at = tokio::time::Instant::now() + TCP_SECOND_PORT_DELAY;
             }
         }
@@ -1260,7 +1280,12 @@ pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Opt
         }
     }
     set.abort_all();
-    lwarn!("[{}] TCP fallback to {} failed: {}", label, dst, if errors.is_empty() { "timeout".to_string() } else { errors.join(", ") });
+    for p in &started {
+        if !errors.iter().any(|e| e.starts_with(&format!("{}:", p))) {
+            errors.push(format!("{}: timeout", p));
+        }
+    }
+    lwarn!("[{}] TCP fallback to {} failed: {}", label, dst, errors.join(", "));
     None
 }
 
@@ -1794,10 +1819,10 @@ async fn serve_core<R, W>(
     if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
         if !dc_configured {
             linfo!("[{}] DC{} not in config -> fallback", label, dc);
-        } else if blacklisted {
-            linfo!("[{}] DC{}{} WS blacklisted -> fallback", label, dc, m_tag);
         } else {
-            // Шанс пулу при случайном таймауте: пробуем забрать готовый WS.
+            // Шанс пулу: и при таймауте, и при чёрном списке. Раньше при
+            // blacklisted пул не спрашивали вовсе, и DC уходил в фолбэк, хотя
+            // в пуле лежали готовые рабочие WS (WS pool refilled DC2: 4 ready).
             if !is_test_dc {
                 let domains = ws_domains(dc, is_media);
                 pooled_ws = pools
@@ -1805,15 +1830,16 @@ async fn serve_core<R, W>(
                     .get(dc, is_media, target.clone(), domains)
                     .await;
             }
+            let why = if blacklisted { "blacklisted" } else { "timed out" };
             if pooled_ws.is_none() {
                 linfo!(
-                    "[{}] DC{}{} WS connect to {} was timed out -> fallback",
-                    label, dc, m_tag, target
+                    "[{}] DC{}{} WS {} ({}) -> fallback",
+                    label, dc, m_tag, why, target
                 );
             } else {
                 linfo!(
-                    "[{}] DC{}{} WS connect to {} was timed out, but pool hit -> using WS",
-                    label, dc, m_tag, target
+                    "[{}] DC{}{} WS {} ({}), but pool hit -> using WS",
+                    label, dc, m_tag, why, target
                 );
                 use_pooled_direct = true;
             }
