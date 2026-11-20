@@ -91,6 +91,7 @@ pub fn reset() {
     h.preferred.clear();
     h.last_ok.clear();
     FLIGHTS.lock().clear();
+    LAST_PROBE.lock().clear();
 }
 
 fn default_secure() -> bool {
@@ -111,6 +112,54 @@ fn usable(h: &Health, key: &str, secure: bool, now: Instant) -> bool {
         Some((_, until)) => now >= *until,
         None => true,
     }
+}
+
+/// Как часто можно пробовать маршрут, когда все в паузе (на группу).
+const PROBE_EVERY: Duration = Duration::from_secs(3);
+
+static LAST_PROBE: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<&'static str, Instant>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Маршрут (домен + режим), пауза которого кончается раньше всех, если с
+/// прошлой пробы в этой группе прошло не меньше PROBE_EVERY.
+fn probe_candidate(
+    targets: &[Target],
+    group: &'static str,
+    primary: bool,
+    auto: bool,
+) -> Option<(Target, bool)> {
+    let now = Instant::now();
+    {
+        let mut lp = LAST_PROBE.lock();
+        if let Some(t) = lp.get(group) {
+            if now.duration_since(*t) < PROBE_EVERY {
+                return None;
+            }
+        }
+        lp.insert(group, now);
+    }
+    let h = HEALTH.lock();
+    let modes: &[bool] = if auto { &[true, false] } else { &[true] };
+    let mut best: Option<(Instant, Target, bool)> = None;
+    for x in targets {
+        for &m in modes {
+            let secure = if auto { m } else { primary };
+            let until = h
+                .fails
+                .get(&(x.key.clone(), secure))
+                .map(|(_, u)| *u)
+                .unwrap_or(now);
+            // При равенстве предпочитаем основной режим.
+            let better = match &best {
+                None => true,
+                Some((bu, _, bs)) => until < *bu || (until == *bu && secure == primary && *bs != primary),
+            };
+            if better {
+                best = Some((until, x.clone(), secure));
+            }
+        }
+    }
+    best.map(|(_, t, s)| (t, s))
 }
 
 fn mark_failed(key: &str, secure: bool, err: &WsError) {
@@ -213,10 +262,30 @@ pub async fn race(
     };
 
     if q1.is_empty() && q2.is_empty() {
-        if !targets.is_empty() {
-            ldebug!("[{}] {}: все маршруты недавно отказали, пропускаю", label, what);
+        if targets.is_empty() {
+            return None;
         }
-        return None;
+        // Все маршруты в паузе. Если доменов мало (свой домен — обычно один),
+        // одна неудача на мобильной сети выключала CF целиком на 20+ с, и все
+        // соединения сразу уходили в TCP fallback. Теперь не чаще раза в
+        // PROBE_EVERY пробуем маршрут, пауза которого кончается раньше всех.
+        match probe_candidate(targets, group, primary, auto) {
+            Some((target, secure)) => {
+                ldebug!(
+                    "[{}] {}: все маршруты в паузе, пробую {} ({})",
+                    label, what, target.key, if secure { "TLS" } else { "порт 80" }
+                );
+                if secure == primary {
+                    q1.push_back(target);
+                } else {
+                    q2.push_back(target);
+                }
+            }
+            None => {
+                ldebug!("[{}] {}: все маршруты недавно отказали, пропускаю", label, what);
+                return None;
+            }
+        }
     }
 
     let start = Instant::now();
@@ -835,9 +904,33 @@ mod tests {
         for _ in 0..4 {
             let _ = race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await;
         }
+        // Все в паузе: одна проба (не дольше одной попытки) ...
         let t2 = Instant::now();
         assert!(race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await.is_none());
-        assert!(t2.elapsed() < Duration::from_millis(50), "{:?}", t2.elapsed());
+        assert!(
+            t2.elapsed() <= fast_timing().attempt + Duration::from_millis(300),
+            "{:?}",
+            t2.elapsed()
+        );
+        // ... а следующая сразу за ней — мгновенный отказ (проба не чаще PROBE_EVERY).
+        let t3 = Instant::now();
+        assert!(race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await.is_none());
+        assert!(t3.elapsed() < Duration::from_millis(50), "{:?}", t3.elapsed());
+    }
+
+    #[tokio::test]
+    async fn single_cooled_domain_is_probed_and_recovers() {
+        let _g = SERIAL.lock().await;
+        setup(true);
+        let _net = start_net(Mode::Ws, Mode::Ws).await;
+        let tg = targets(1);
+        // Свой домен один и «отказал» (моргнула мобильная сеть) в обоих режимах.
+        let err = WsError::Timeout;
+        mark_failed(&tg[0].key, true, &err);
+        mark_failed(&tg[0].key, false, &err);
+        // Раньше здесь был мгновенный None на 20+ с; теперь — проба и успех.
+        let r = race(&tg, "/apiws", GROUP_CF, "t", "CF", true).await;
+        assert!(r.is_some());
     }
 
     #[tokio::test]

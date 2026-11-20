@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
@@ -99,13 +100,29 @@ fun LogsTab(settingsStore: SettingsStore) {
                     Icon(Icons.Default.Delete, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.clear), tint = MaterialTheme.colorScheme.primary)
                 }
                 IconButton(onClick = {
-                    val text = filteredLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                    // Копируем полный журнал по порядку и с временем, а не то,
+                    // что поместилось на экран.
+                    val text = LogManager.fullText().ifEmpty {
+                        filteredLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                    }
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText("TgWsProxy Logs", text)
                     clipboard.setPrimaryClip(clip)
                     Toast.makeText(context, context.getString(com.amurcanov.tgwsproxy.R.string.copied), Toast.LENGTH_SHORT).show()
                 }) {
                     Icon(Icons.Default.ContentCopy, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.copy), tint = MaterialTheme.colorScheme.primary)
+                }
+                IconButton(onClick = {
+                    // «Поделиться» файлом-текстом: удобнее, чем буфер обмена, для длинного лога.
+                    val text = LogManager.fullText()
+                    val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(android.content.Intent.EXTRA_SUBJECT, "TgWsProxy log")
+                        putExtra(android.content.Intent.EXTRA_TEXT, text)
+                    }
+                    context.startActivity(android.content.Intent.createChooser(send, "Отправить лог"))
+                }) {
+                    Icon(Icons.Default.Share, contentDescription = "Отправить лог", tint = MaterialTheme.colorScheme.primary)
                 }
             }
         }

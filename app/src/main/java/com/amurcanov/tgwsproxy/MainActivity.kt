@@ -587,11 +587,31 @@ private fun AppBackdrop(modifier: Modifier = Modifier) {
  * Key optimizations:
  * - Channel-based buffering: log lines are queued, not applied immediately
  * - Batch processing: up to 20 lines applied per tick (every 150ms)
- * - Array-backed list with cap of 50: avoids growing/shrinking allocations
- * - Duplicate merging: last-entry count increment done in-place conceptually
+ * - On-screen list capped at 300, consecutive duplicates merged in place
+ * - Full chronological log (up to 3000 lines, with time) kept for copy/share
  */
 object LogManager {
     val logs = MutableStateFlow<List<LogEntry>>(emptyList())
+
+    // Полный журнал для копирования/отправки: по порядку, с временем, без
+    // склейки и перестановок. На экране — короткий список, тут — до FULL_CAP строк.
+    private const val FULL_CAP = 3000
+    private val fullLog = ArrayDeque<String>()
+    private val timeFmt = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+
+    @Synchronized
+    private fun appendFull(entry: LogEntry) {
+        val level = when (entry.priority) { 6 -> "E"; 5 -> "W"; 3 -> "D"; else -> "I" }
+        fullLog.addLast("${timeFmt.format(java.util.Date())} $level ${entry.message}")
+        while (fullLog.size > FULL_CAP) fullLog.removeFirst()
+    }
+
+    /** Весь журнал текстом, по порядку, для буфера обмена или «Поделиться». */
+    @Synchronized
+    fun fullText(): String = fullLog.joinToString("\n")
+
+    @Synchronized
+    private fun clearFull() = fullLog.clear()
     private var job: Job? = null
     private var logcatProcess: Process? = null
     private val nextKey = AtomicLong(0)
@@ -633,7 +653,9 @@ object LogManager {
                     // Drain the channel (non-blocking)
                     var received = logChannel.tryReceive()
                     while (received.isSuccess) {
-                        pendingBatch.add(received.getOrThrow())
+                        val e = received.getOrThrow()
+                        appendFull(e)
+                        pendingBatch.add(e)
                         if (pendingBatch.size >= 20) break // cap batch size
                         received = logChannel.tryReceive()
                     }
@@ -660,21 +682,17 @@ object LogManager {
     private fun applyBatch(current: List<LogEntry>, batch: List<LogEntry>): List<LogEntry> {
         val result = ArrayDeque(current)
         for (entry in batch) {
-            var merged = false
-            val searchDepth = minOf(result.size, 10)
-            for (i in result.indices.reversed().take(searchDepth)) {
-                if (result[i].message == entry.message) {
-                    val existing = result.removeAt(i)
-                    result.addLast(existing.copy(count = existing.count + 1))
-                    merged = true
-                    break
-                }
-            }
-            if (!merged) {
+            // Склеиваем только подряд идущие одинаковые строки и не переносим
+            // их в конец: раньше склейка по последним 10 строкам переставляла
+            // события местами, и лог читался не по порядку.
+            val last = result.lastOrNull()
+            if (last != null && last.message == entry.message) {
+                result[result.size - 1] = last.copy(count = last.count + 1)
+            } else {
                 result.addLast(entry)
             }
         }
-        while (result.size > 50) {
+        while (result.size > 300) {
             result.removeFirst()
         }
         return result.toList()
@@ -689,6 +707,7 @@ object LogManager {
 
     fun clearLogs() {
         logs.value = emptyList()
+        clearFull()
     }
 
     private fun parseLine(raw: String): LogEntry? {
