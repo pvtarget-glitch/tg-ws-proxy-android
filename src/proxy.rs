@@ -1721,7 +1721,11 @@ async fn serve_core<R, W>(
     let proto = LittleEndian::read_u32(proto_tag);
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
-        lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        note_bad_handshake(&label);
+        // Клиент с чужим секретом переподключается без паузы (сотни раз в
+        // секунду) и забивает лог и процессор. Держим отказ 2 с — это
+        // замедляет его цикл в десятки раз и ничего не стоит.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         return;
     }
 
@@ -2368,3 +2372,40 @@ mod tcp_port_tests {
         assert!(t0.elapsed() < TCP_SECOND_PORT_DELAY, "{:?}", t0.elapsed());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Отказы из-за неверного секрета: первая строка сразу, дальше сводка раз в 10 с.
+// ---------------------------------------------------------------------------
+
+static BAD_HS_LOG: once_cell::sync::Lazy<parking_lot::Mutex<(Option<std::time::Instant>, u64)>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new((None, 0)));
+
+fn note_bad_handshake(label: &str) {
+    let now = std::time::Instant::now();
+    let mut g = BAD_HS_LOG.lock();
+    match g.0 {
+        None => {
+            g.0 = Some(now);
+            g.1 = 0;
+            lwarn!(
+                "[{}] bad handshake (wrong secret or proto) — скорее всего, в Telegram \
+                 выбран прокси с другим секретом; удалите старые записи прокси и \
+                 добавьте заново по ссылке из приложения",
+                label
+            );
+        }
+        Some(since) => {
+            g.1 += 1;
+            if now.duration_since(since) >= Duration::from_secs(10) {
+                lwarn!(
+                    "bad handshake: ещё {} подключений с неверным секретом за {} с",
+                    g.1,
+                    now.duration_since(since).as_secs()
+                );
+                g.0 = Some(now);
+                g.1 = 0;
+            }
+        }
+    }
+}
+
