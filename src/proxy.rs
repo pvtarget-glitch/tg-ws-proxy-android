@@ -326,6 +326,32 @@ impl WsPool {
         );
     }
 
+    /// Сбросить пул слота: соединение из него оказалось закрытым (обычно после
+    /// обрыва связи сервер закрывает разом и те, что лежат в пуле). Без сброса
+    /// каждое следующее подключение брало ещё одно мёртвое соединение и теряло
+    /// на нём до 2 с.
+    pub async fn drain(&self, dc: i32, is_media: bool) {
+        let slot = DcSlot {
+            dc,
+            is_media: is_media_int(is_media),
+        };
+        let state = self.get_slot(slot).await;
+        let dead: Vec<_> = state.queue.lock().await.drain(..).collect();
+        if !dead.is_empty() {
+            linfo!(
+                "WS pool DC{}{}: соединение из пула оказалось закрытым, сбрасываю ещё {}",
+                dc,
+                if is_media { "m" } else { "" },
+                dead.len()
+            );
+            tokio::spawn(async move {
+                for e in dead {
+                    e.ws.close().await;
+                }
+            });
+        }
+    }
+
     pub async fn report_success(&self, dc: i32, is_media: bool) {
         let slot = DcSlot {
             dc,
@@ -2045,6 +2071,7 @@ async fn serve_core<R, W>(
     } else {
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
         ws.close().await;
+        pools.ws.drain(dc, is_media).await;
 
         DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
 
