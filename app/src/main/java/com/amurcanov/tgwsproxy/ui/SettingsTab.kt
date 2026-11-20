@@ -409,6 +409,53 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 )
             }
 
+            if (cfEnabled) {
+                // Свой CF-домен (kwsN.<домен> -> IP дата-центров, Proxied, SSL Flexible).
+                // Если задан, используется вместо общего списка доменов.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Свой CF-домен",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = customCfDomainEnabled,
+                        onCheckedChange = {
+                            customCfDomainEnabled = it
+                            scheduleSave()
+                        },
+                        enabled = !isRunning
+                    )
+                }
+                if (customCfDomainEnabled) {
+                    OutlinedTextField(
+                        value = customCfDomain,
+                        onValueChange = {
+                            customCfDomain = it.trim()
+                            scheduleSave()
+                        },
+                        enabled = !isRunning,
+                        singleLine = true,
+                        placeholder = { Text("example.com, запасной.org") },
+                        supportingText = {
+                            Text("Через запятую. Заменяет общий список доменов.")
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(24.dp),
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                        )
+                    )
+                }
+            }
+
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 
             Row(
