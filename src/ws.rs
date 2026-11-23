@@ -8,12 +8,19 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
+use tokio::sync::Semaphore;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Diagnostic IDs, never logged together with protocol payloads or keys.
 static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIAL_ID: AtomicU64 = AtomicU64::new(1);
+
+// Global limit for fresh direct Telegram WebSocket dials (including pool warmup).
+// CF/worker requests are intentionally not subject to this limiter.
+const MAX_PARALLEL_DIRECT_WS: usize = 4;
+const DIRECT_WS_QUEUE_TIMEOUT: Duration = Duration::from_millis(1000);
+static DIRECT_WS_SLOTS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_PARALLEL_DIRECT_WS));
 
 fn error_class(err: &WsError) -> String {
     match err {
@@ -22,6 +29,8 @@ fn error_class(err: &WsError) -> String {
         WsError::Timeout => "timeout".to_string(),
         WsError::Canceled => "canceled".to_string(),
         WsError::Other(_) => "other".to_string(),
+        WsError::RemoteClose { code, reason_len } => format!("remote_close:code={:?}:reason_len={}", code, reason_len),
+        WsError::Busy => "direct_dial_busy".to_string(),
     }
 }
 use std::sync::Arc;
@@ -284,6 +293,8 @@ pub enum WsError {
     Handshake(WsHandshakeError),
     Timeout,
     Canceled,
+    RemoteClose { code: Option<u16>, reason_len: usize },
+    Busy,
     Other(String),
 }
 
@@ -303,6 +314,8 @@ impl WsError {
                 }
             }
             WsError::Other(s) => s.clone(),
+            WsError::RemoteClose { code, reason_len } => format!("remote close code={:?} reason_len={}", code, reason_len),
+            WsError::Busy => "direct dial queue saturated".to_string(),
         }
     }
     pub fn handshake_status(&self) -> Option<i32> {
@@ -436,10 +449,7 @@ impl RawWebSocket {
     pub async fn recv(&self) -> Result<Vec<u8>, WsError> {
         loop {
             if self.is_closed() {
-                return Err(WsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF",
-                )));
+                return Err(WsError::Canceled);
             }
             let (opcode, payload, fin) = match self.read_frame().await {
                 Ok(v) => v,
@@ -460,10 +470,7 @@ impl RawWebSocket {
                     }
                     let reply = build_frame(OP_CLOSE, &close_payload, true);
                     let _ = self.write_frame(&reply, WS_CONTROL_TIMEOUT).await;
-                    return Err(WsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "EOF",
-                    )));
+                    return Err(WsError::RemoteClose { code, reason_len: reason.len() });
                 }
                 OP_PING => {
                     let pong = build_frame(OP_PONG, &payload, true);
@@ -515,36 +522,36 @@ impl RawWebSocket {
     pub async fn recv_with_timeout(&self, dur: Duration) -> Result<Vec<u8>, WsError> {
         loop {
             if self.is_closed() {
-                return Err(WsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF",
-                )));
+                return Err(WsError::Canceled);
             }
             let frame = {
                 let mut reader = self.reader.lock().await;
                 match tokio::time::timeout(dur, read_frame_match(&mut reader)).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
+                        ldebug!("RC4 WS id={} event=frame_read_error class={}", self.id, error_class(&e));
                         self.closed.store(true, Ordering::Relaxed);
                         return Err(e);
                     }
-                    Err(_) => return Err(WsError::Timeout),
+                    Err(_) => {
+                        ldebug!("RC4 WS id={} event=frame_read_timeout", self.id);
+                        return Err(WsError::Timeout);
+                    },
                 }
             };
             let (opcode, payload, fin) = frame;
             match opcode {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
+                    let (code, reason) = parse_close(&payload);
+                    ldebug!("RC4 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason.len());
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
                     }
                     let reply = build_frame(OP_CLOSE, &close_payload, true);
                     let _ = self.write_frame(&reply, WS_CONTROL_TIMEOUT).await;
-                    return Err(WsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "EOF",
-                    )));
+                    return Err(WsError::RemoteClose { code, reason_len: reason.len() });
                 }
                 OP_PING => {
                     let pong = build_frame(OP_PONG, &payload, true);
@@ -1074,6 +1081,29 @@ async fn ws_connect_inner(
     result
 }
 
+// All direct connections (new client, retries and WS pool) use one transport.
+// Global backpressure prevents a failed network from spawning dozens of TCP dials.
+pub async fn ws_connect_direct_limited(
+    ip: &str, domain: &str, path: &str, timeout: f64, sni: Option<&str>,
+) -> Result<RawWebSocket, WsError> {
+    let queued_at = std::time::Instant::now();
+    let _permit = match tokio::time::timeout(
+        DIRECT_WS_QUEUE_TIMEOUT, DIRECT_WS_SLOTS.acquire()
+    ).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return Err(WsError::Canceled),
+        Err(_) => {
+            ldebug!("RC4 DIRECT event=backpressure max_inflight={} queued_ms={}",
+                MAX_PARALLEL_DIRECT_WS, queued_at.elapsed().as_millis());
+            return Err(WsError::Busy);
+        }
+    };
+    ldebug!("RC4 DIRECT event=slot_acquired max_inflight={} queued_ms={}",
+        MAX_PARALLEL_DIRECT_WS, queued_at.elapsed().as_millis());
+    // Keep explicit TLS regardless of the CF mode's DISABLE_SECURE setting.
+    ws_connect_full_opts(ip, domain, path, timeout, sni, Some(true)).await
+}
+
 // wsConnect: пытается ip, при необходимости резолвит DoH
 pub async fn ws_connect(
     ip: &str,
@@ -1145,7 +1175,7 @@ pub async fn connect_one_ws_full(
                 return Some(ws);
             }
         }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
+        match ws_connect_direct_limited(ip, d, path, timeout, None).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
                 return Some(ws);
@@ -1173,7 +1203,7 @@ pub async fn connect_one_ws_full(
 
 pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), Some(true)).await {
+    match ws_connect_direct_limited(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI)).await {
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);
