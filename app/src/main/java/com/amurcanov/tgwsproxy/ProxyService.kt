@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -24,6 +28,66 @@ import java.net.ServerSocket
 class ProxyService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var networkManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetworkState: String = ""
+
+    private fun describeNetwork(cap: NetworkCapabilities?): String {
+        if (cap == null) return "capabilities=unknown"
+        val transport = when {
+            cap.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            cap.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            cap.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            cap.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+            else -> "other"
+        }
+        return "transport=$transport validated=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}" +
+                " internet=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}"
+    }
+
+    private fun registerNetworkDiagnostics() {
+        val manager = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.i("TgWsProxy", "RC3 NETWORK event=available")
+            }
+            override fun onLost(network: Network) {
+                Log.i("TgWsProxy", "RC3 NETWORK event=lost")
+                lastNetworkState = ""
+            }
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                val state = describeNetwork(caps)
+                if (lastNetworkState != state) {
+                    lastNetworkState = state
+                    Log.i("TgWsProxy", "RC3 NETWORK event=capabilities $state")
+                }
+            }
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                manager.registerDefaultNetworkCallback(callback)
+            } else {
+                manager.registerNetworkCallback(NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), callback)
+            }
+            networkManager = manager
+            networkCallback = callback
+            Log.i("TgWsProxy", "RC3 NETWORK event=registered sdk=${Build.VERSION.SDK_INT}")
+        } catch (e: Exception) {
+            Log.w("TgWsProxy", "RC3 NETWORK event=register_failed type=${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun unregisterNetworkDiagnostics() {
+        try {
+            networkCallback?.let { networkManager?.unregisterNetworkCallback(it) }
+        } catch (e: Exception) {
+            Log.w("TgWsProxy", "RC3 NETWORK event=unregister_failed type=${e.javaClass.simpleName}")
+        } finally {
+            networkCallback = null
+            networkManager = null
+        }
+    }
     private var statsJob: Job? = null
     private var restartJob: Job? = null
     private var lastNotificationContent: String = ""
@@ -78,6 +142,7 @@ class ProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        registerNetworkDiagnostics()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -501,6 +566,7 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterNetworkDiagnostics()
         restartJob?.cancel()
         restartJob = null
         statsJob?.cancel()
