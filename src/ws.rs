@@ -979,16 +979,29 @@ async fn ws_connect_inner(
         Err(_) => format!("{}:{}", dial_addr, port),
     };
 
+    let started = std::time::Instant::now();
     let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(WsError::Io(e)),
-        Err(_) => return Err(WsError::Timeout),
+        Ok(Ok(c)) => {
+            ldebug!("RC2 stage=tcp result=ok elapsed_ms={}", started.elapsed().as_millis());
+            c
+        }
+        Ok(Err(e)) => {
+            ldebug!("RC2 stage=tcp result=io_error elapsed_ms={} kind={:?}", started.elapsed().as_millis(), e.kind());
+            return Err(WsError::Io(e));
+        }
+        Err(_) => {
+            ldebug!("RC2 stage=tcp result=timeout elapsed_ms={}", started.elapsed().as_millis());
+            return Err(WsError::Timeout);
+        }
     };
     set_sock_opts(&raw_conn);
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);
-        return handshake_plain(read_half, write_half, domain, path, timeout, dpi).await;
+        let started = std::time::Instant::now();
+        let result = handshake_plain(read_half, write_half, domain, path, timeout, dpi).await;
+        ldebug!("RC2 stage=ws result={} elapsed_ms={}", if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis());
+        return result;
     }
 
     let sni_name = sni.unwrap_or(domain);
@@ -1003,23 +1016,32 @@ async fn ws_connect_inner(
     let raw_conn = DpiStream::new(raw_conn, if dpi { Some(sni_name) } else { None });
 
     let handshake_timeout = ws_handshake_timeout(timeout);
+    let started = std::time::Instant::now();
     let tls_conn =
         match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
-            Ok(Ok(c)) => c,
+            Ok(Ok(c)) => {
+                ldebug!("RC2 stage=tls result=ok elapsed_ms={}", started.elapsed().as_millis());
+                c
+            }
             Ok(Err(e)) => {
+                ldebug!("RC2 stage=tls result=io_error elapsed_ms={} kind={:?}", started.elapsed().as_millis(), e.kind());
                 if e.kind() != std::io::ErrorKind::ConnectionReset {
                     ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
                 }
                 return Err(WsError::Io(e));
             }
             Err(_) => {
+                ldebug!("RC2 stage=tls result=timeout elapsed_ms={}", started.elapsed().as_millis());
                 ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
                 return Err(WsError::Timeout);
             }
         };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
-    handshake_tls(read_half, write_half, domain, path, timeout).await
+    let started = std::time::Instant::now();
+    let result = handshake_tls(read_half, write_half, domain, path, timeout).await;
+    ldebug!("RC2 stage=ws result={} elapsed_ms={}", if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis());
+    result
 }
 
 // wsConnect: пытается ip, при необходимости резолвит DoH
