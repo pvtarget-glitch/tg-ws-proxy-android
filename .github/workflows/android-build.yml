@@ -35,8 +35,8 @@ env:
 jobs:
   rust-test:
     name: Rust tests (host)
-    # Metadata-only promotion must not rebuild/re-sign APKs.
-    if: ${{ !contains(github.event.head_commit.message, '[promote-rc4]') }}
+    # Metadata-only changes must not rebuild/re-sign APKs.
+    if: ${{ !contains(github.event.head_commit.message, '[promote-rc4]') && !contains(github.event.head_commit.message, '[mark-latest-rc4]') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -203,8 +203,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   promote-rc4:
-    name: Promote v1.2.4.1-rc4 to stable (metadata only)
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/diagnostics/rc4-20261123' && contains(github.event.head_commit.message, '[promote-rc4]') }}
+    name: Set v1.2.4.1-rc4 stable and Latest (metadata only)
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/diagnostics/rc4-20261123' && (contains(github.event.head_commit.message, '[promote-rc4]') || contains(github.event.head_commit.message, '[mark-latest-rc4]')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -216,6 +216,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api --method PATCH "repos/${GH_REPO}/releases/455974928" -F prerelease=false
+          gh api --method PATCH "repos/${GH_REPO}/releases/455974928" -F prerelease=false -f make_latest=true
           test "$(gh api "repos/${GH_REPO}/releases/455974928" --jq '.prerelease')" = "false"
-          echo "RC4 release promoted to stable. Existing APK assets and tag left unchanged."
+          test "$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name')" = "v1.2.4.1-rc4"
+          echo "RC4 is now Latest. Existing APK assets and tag left unchanged."
