@@ -3,6 +3,7 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
+use crate::transport_policy::DirectFailure;
 use crate::{ldebug, linfo, lwarn};
 use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
@@ -1965,6 +1966,7 @@ async fn serve_core<R, W>(
     let mut ws_opt = pooled_ws;
     let mut ws_failed_redirect = false;
     let mut ws_timed_out = false;
+    let mut ws_busy = false;
     let mut all_redirects = true;
 
     if ws_opt.is_none() && !is_test_dc {
@@ -2011,7 +2013,8 @@ async fn serve_core<R, W>(
                     continue;
                 }
                 Err(WsError::Busy) => {
-                    ldebug!("RC4 DIRECT event=busy dc={} media={} action=fallback", dc, is_media);
+                    ldebug!("ARCH DIRECT event=local_capacity dc={} media={} action=fallback", dc, is_media);
+                    ws_busy = true;
                     all_redirects = false;
                     break;
                 }
@@ -2039,9 +2042,15 @@ async fn serve_core<R, W>(
         all_redirects = false;
     }
 
-    // WS failed -> fallback (порт оригинала 1-в-1).
+    // The failure policy is independent of the transport and pool.
+    // A full local admission queue must never blacklist/penalize a remote DC.
     if ws_opt.is_none() {
-        if ws_timed_out && !target.is_empty() {
+        let failure = DirectFailure::classify(
+            ws_busy, ws_timed_out, ws_failed_redirect, all_redirects
+        );
+        ldebug!("ARCH POLICY event=direct_failed dc={} media={} kind={:?}",
+            dc, is_media, failure);
+        if failure.penalize_ip() && !target.is_empty() {
             IP_FAIL_UNTIL
                 .write()
                 .insert(target.clone(), now + ip_fail_cooldown());
@@ -2051,17 +2060,18 @@ async fn serve_core<R, W>(
             );
         }
 
-        if ws_failed_redirect && all_redirects {
+        if failure.blacklist_for_redirect() {
             WS_BLACKLIST.write().insert(dc_key, true);
             lwarn!("[{}] DC{}{} blacklisted for WS (all 302)", label, dc, m_tag);
-        } else if ws_failed_redirect {
-            DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
-        } else {
+        } else if failure.penalize_dc() {
             DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
             linfo!(
                 "[{}] DC{}{} WS failed for {}s",
                 label, dc, m_tag, DC_FAIL_COOLDOWN as i64
             );
+        } else {
+            ldebug!("ARCH POLICY event=skip_remote_penalty dc={} media={}",
+                dc, is_media);
         }
 
         let splitter_fb = MsgSplitter::new(&relay_init, proto_int);
