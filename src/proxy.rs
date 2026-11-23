@@ -1013,6 +1013,9 @@ pub async fn bridge_ws<R, W>(
                             WsError::Canceled => "canceled".to_string(),
                             WsError::Timeout => "timeout".to_string(),
                             WsError::Other(_) => "other".to_string(),
+                            WsError::RemoteClose { code, reason_len } =>
+                                format!("remote_close:code={:?}:reason_len={}", code, reason_len),
+                            WsError::Busy => "direct_dial_busy".to_string(),
                         };
                         *close_reason_down_c.lock().await = format!("upstream: {}", class);
                     }
@@ -1978,7 +1981,7 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await {
+            match ws_connect_direct_limited(&target, domain, ws_path, ws_timeout, None).await {
                 Ok(ws) => {
                     all_redirects = false;
                     ws_opt = Some(ws);
@@ -2006,6 +2009,11 @@ async fn serve_core<R, W>(
                         label, dc, m_tag, h.status_line
                     );
                     continue;
+                }
+                Err(WsError::Busy) => {
+                    ldebug!("RC4 DIRECT event=busy dc={} media={} action=fallback", dc, is_media);
+                    all_redirects = false;
+                    break;
                 }
                 Err(WsError::Timeout) => {
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2200,7 +2208,7 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in domains {
-        match ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await {
+        match ws_connect_direct_limited(target, dom, ws_path, timeout, None).await {
             Ok(ws) => return (Some(ws), ws_failed_redirect, false),
             Err(WsError::Handshake(h)) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2209,6 +2217,11 @@ pub async fn connect_direct_ws(
                 } else {
                     all_redirects = false;
                 }
+            }
+            Err(WsError::Busy) => {
+                ldebug!("RC4 DIRECT event=busy action=retry_fallback");
+                all_redirects = false;
+                break;
             }
             Err(WsError::Timeout) => {
                 // Как в оригинале: таймаут прерывает перебор, all_redirects не трогаем.
