@@ -19,11 +19,11 @@ on:
       version:
         description: 'Release tag (e.g. v1.2.4.0-cf)'
         required: false
-        default: 'v1.2.4.1-rc4'
+        default: 'v1.2.5.0-rc1'
   push:
     tags: ['v*']
     branches:
-      - 'diagnostics/rc4-20261123'
+      - 'refactor/v1.2.5.0-rc1'
 
 permissions:
   contents: read
@@ -131,7 +131,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:INPUT_TAG }
-          if ($env:GITHUB_REF -eq 'refs/heads/diagnostics/rc4-20261123') { $tag = 'v1.2.4.1-rc4' }
+          if ($env:GITHUB_REF -eq 'refs/heads/refactor/v1.2.5.0-rc1') { $tag = 'v1.2.5.0-rc1' }
           if ([string]::IsNullOrEmpty($tag)) { $tag = 'dev' }
           $ver = $tag.TrimStart('v')
           $map = @{ 'universal' = 'universal'; 'arm64' = 'v8a-minsdk24'; 'arm32' = 'v7a-minsdk21' }
@@ -159,7 +159,7 @@ jobs:
       ${{ startsWith(github.ref, 'refs/tags/v') ||
           (github.event_name == 'workflow_dispatch' &&
            github.event.inputs.make_release == 'true') ||
-          github.ref == 'refs/heads/diagnostics/rc4-20261123' }}
+          github.ref == 'refs/heads/refactor/v1.2.5.0-rc1' }}
     permissions:
       contents: write
     steps:
@@ -171,7 +171,7 @@ jobs:
 
       - name: Release notes for this version
         env:
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/diagnostics/rc4-20261123' && 'v1.2.4.1-rc4') || github.event.inputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/refactor/v1.2.5.0-rc1' && 'v1.2.5.0-rc1') || github.event.inputs.version }}
         run: |
           f="src/.github/release-notes/${TAG}.md"
           if [ -f "$f" ]; then
@@ -190,12 +190,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/diagnostics/rc4-20261123' && 'v1.2.4.1-rc4') || github.event.inputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/refactor/v1.2.5.0-rc1' && 'v1.2.5.0-rc1') || github.event.inputs.version }}
           target_commitish: ${{ github.sha }}
-          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/diagnostics/rc4-20261123' && 'v1.2.4.1-rc4') || github.event.inputs.version }} (unofficial)
+          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/refactor/v1.2.5.0-rc1' && 'v1.2.5.0-rc1') || github.event.inputs.version }} (unofficial)
           body_path: release-notes.md
           files: dist/*
           draft: false
-          prerelease: ${{ github.ref == 'refs/heads/diagnostics/rc4-20261123' || contains(github.ref_name, '-rc') }}
+          prerelease: ${{ github.ref == 'refs/heads/refactor/v1.2.5.0-rc1' || contains(github.ref_name, '-rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
