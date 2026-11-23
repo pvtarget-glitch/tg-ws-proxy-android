@@ -8,19 +8,16 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
-use tokio::sync::Semaphore;
+use crate::connection_manager::{
+    AdmissionError, DialPurpose, BACKGROUND_QUEUE_TIMEOUT, CLIENT_QUEUE_TIMEOUT,
+    DIRECT_SCHEDULER, MAX_PARALLEL_DIRECT_WS,
+};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Diagnostic IDs, never logged together with protocol payloads or keys.
 static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIAL_ID: AtomicU64 = AtomicU64::new(1);
-
-// Global limit for fresh direct Telegram WebSocket dials (including pool warmup).
-// CF/worker requests are intentionally not subject to this limiter.
-const MAX_PARALLEL_DIRECT_WS: usize = 4;
-const DIRECT_WS_QUEUE_TIMEOUT: Duration = Duration::from_millis(1000);
-static DIRECT_WS_SLOTS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_PARALLEL_DIRECT_WS));
 
 fn error_class(err: &WsError) -> String {
     match err {
@@ -1083,26 +1080,44 @@ async fn ws_connect_inner(
     result
 }
 
-// All direct connections (new client, retries and WS pool) use one transport.
-// Global backpressure prevents a failed network from spawning dozens of TCP dials.
+// Client-facing connections and background warmup have different admission
+// budgets, but share the same global direct connection scheduler.
 pub async fn ws_connect_direct_limited(
     ip: &str, domain: &str, path: &str, timeout: f64, sni: Option<&str>,
 ) -> Result<RawWebSocket, WsError> {
+    ws_connect_direct_scheduled(ip, domain, path, timeout, sni, DialPurpose::Client).await
+}
+
+async fn ws_connect_direct_background(
+    ip: &str, domain: &str, path: &str, timeout: f64, sni: Option<&str>,
+) -> Result<RawWebSocket, WsError> {
+    ws_connect_direct_scheduled(ip, domain, path, timeout, sni, DialPurpose::BackgroundPool).await
+}
+
+async fn ws_connect_direct_scheduled(
+    ip: &str, domain: &str, path: &str, timeout: f64, sni: Option<&str>,
+    purpose: DialPurpose,
+) -> Result<RawWebSocket, WsError> {
     let queued_at = std::time::Instant::now();
-    let _permit = match tokio::time::timeout(
-        DIRECT_WS_QUEUE_TIMEOUT, DIRECT_WS_SLOTS.acquire()
-    ).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) => return Err(WsError::Canceled),
-        Err(_) => {
-            ldebug!("RC4 DIRECT event=backpressure max_inflight={} queued_ms={}",
-                MAX_PARALLEL_DIRECT_WS, queued_at.elapsed().as_millis());
+    let max_wait = match purpose {
+        DialPurpose::Client => CLIENT_QUEUE_TIMEOUT,
+        DialPurpose::BackgroundPool => BACKGROUND_QUEUE_TIMEOUT,
+    };
+    // Background pool warmup may occupy at most half the slots.
+    // Local congestion is not evidence of Telegram server unavailability.
+    let _permit = match DIRECT_SCHEDULER.acquire(purpose, max_wait).await {
+        Ok(p) => p,
+        Err(AdmissionError::Busy) => {
+            ldebug!("ARCH SCHED event=busy class={} queued_ms={} free_global={}",
+                purpose.label(), queued_at.elapsed().as_millis(), DIRECT_SCHEDULER.available_global());
             return Err(WsError::Busy);
         }
+        Err(AdmissionError::Closed) => return Err(WsError::Canceled),
     };
-    ldebug!("RC4 DIRECT event=slot_acquired max_inflight={} queued_ms={}",
-        MAX_PARALLEL_DIRECT_WS, queued_at.elapsed().as_millis());
-    // Keep explicit TLS regardless of the CF mode's DISABLE_SECURE setting.
+    ldebug!("ARCH SCHED event=admitted class={} queued_ms={} free_global={}",
+        purpose.label(), queued_at.elapsed().as_millis(), DIRECT_SCHEDULER.available_global());
+    // Retain RC4's known direct transport configuration (TLS), regardless
+    // of the independent CF transport default.
     ws_connect_full_opts(ip, domain, path, timeout, sni, Some(true)).await
 }
 
@@ -1177,7 +1192,7 @@ pub async fn connect_one_ws_full(
                 return Some(ws);
             }
         }
-        match ws_connect_direct_limited(ip, d, path, timeout, None).await {
+        match ws_connect_direct_background(ip, d, path, timeout, None).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
                 return Some(ws);
@@ -1205,7 +1220,7 @@ pub async fn connect_one_ws_full(
 
 pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_direct_limited(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI)).await {
+    match ws_connect_direct_background(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI)).await {
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);
