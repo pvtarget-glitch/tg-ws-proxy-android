@@ -8,7 +8,9 @@ use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -177,6 +179,9 @@ impl WsPool {
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
                 if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_closed() {
+                    ldebug!("RC3 POOL event=discard dc={} media={} ws_id={} age_ms={} reason={}",
+                        dc, is_media, entry.ws.diagnostic_id(), (age.max(0.0) * 1000.0) as u64,
+                        if entry.ws.is_closed() { "locally_closed" } else { "max_age" });
                     let e = entry;
                     tokio::spawn(async move {
                         e.ws.close().await;
@@ -185,7 +190,8 @@ impl WsPool {
                 }
                 STATS.pool_hits.fetch_add(1, Ordering::Relaxed);
                 ldebug!(
-                    "WS pool hit DC{}{} (age={:.1}s, left={})",
+                    "RC3 POOL event=checkout ws_id={} DC{}{} (age={:.1}s, left={})",
+                    entry.ws.diagnostic_id(),
                     dc,
                     if is_media { "m" } else { "" },
                     age,
@@ -274,6 +280,8 @@ impl WsPool {
                 let now = now_monotonic();
                 let mut q = state.queue.lock().await;
                 if q.len() < 16 {
+                    ldebug!("RC3 POOL event=insert dc={} media={} ws_id={}",
+                        slot.dc, slot.is_media != 0, ws.diagnostic_id());
                     q.push_back(PoolEntry { ws, created: now });
                     connected += 1;
                 } else {
@@ -338,6 +346,8 @@ impl WsPool {
         let state = self.get_slot(slot).await;
         let dead: Vec<_> = state.queue.lock().await.drain(..).collect();
         if !dead.is_empty() {
+            ldebug!("RC3 POOL event=drain dc={} media={} remaining_ids={:?}",
+                dc, is_media, dead.iter().map(|e| e.ws.diagnostic_id()).collect::<Vec<_>>());
             linfo!(
                 "WS pool DC{}{}: соединение из пула оказалось закрытым, сбрасываю ещё {}",
                 dc,
@@ -846,6 +856,8 @@ pub async fn bridge_ws<R, W>(
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     let cancel = Arc::new(tokio::sync::Notify::new());
     let start = now_monotonic();
+    let first_up_ms = Arc::new(AtomicU64::new(0));
+    let first_down_ms = Arc::new(AtomicU64::new(0));
 
     let mut conn_read = conn_read;
     let mut conn_write = conn_write;
@@ -890,6 +902,7 @@ pub async fn bridge_ws<R, W>(
     let up_packets = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let up_bytes_c = up_bytes.clone();
     let up_packets_c = up_packets.clone();
+    let first_up_c = first_up_ms.clone();
     let close_reason_up = Arc::new(Mutex::new(String::new()));
     let close_reason_up_c = close_reason_up.clone();
     let up_task = tokio::spawn(async move {
@@ -932,6 +945,8 @@ pub async fn bridge_ws<R, W>(
                 }
             };
 
+            first_up_c.compare_exchange(0, ((now_monotonic() - start) * 1000.0).max(1.0) as u64,
+                Ordering::Relaxed, Ordering::Relaxed).ok();
             let chunk = &mut buf[..n];
             STATS.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
             up_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
@@ -972,6 +987,7 @@ pub async fn bridge_ws<R, W>(
     let down_packets = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let down_bytes_c = down_bytes.clone();
     let down_packets_c = down_packets.clone();
+    let first_down_c = first_down_ms.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
     let down_task = tokio::spawn(async move {
@@ -988,15 +1004,23 @@ pub async fn bridge_ws<R, W>(
                         "upstream: timeout".to_string();
                     break;
                 }
-                Err(_) => {
+                Err(e) => {
                     let cur = close_reason_down_c.lock().await.clone();
                     if cur.is_empty() {
-                        *close_reason_down_c.lock().await =
-                            "upstream: ws_close".to_string();
+                        let class = match &e {
+                            WsError::Io(io) => format!("io:{:?}:os={:?}", io.kind(), io.raw_os_error()),
+                            WsError::Handshake(h) => format!("http:{}", h.status_code),
+                            WsError::Canceled => "canceled".to_string(),
+                            WsError::Timeout => "timeout".to_string(),
+                            WsError::Other(_) => "other".to_string(),
+                        };
+                        *close_reason_down_c.lock().await = format!("upstream: {}", class);
                     }
                     break;
                 }
             };
+            first_down_c.compare_exchange(0, ((now_monotonic() - start) * 1000.0).max(1.0) as u64,
+                Ordering::Relaxed, Ordering::Relaxed).ok();
             let n = data.len();
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
@@ -1044,6 +1068,12 @@ pub async fn bridge_ws<R, W>(
         elapsed
     );
 
+    linfo!("RC3 TRANSFER session={} ws_id={} dc={} media={} first_up_ms={} first_down_ms={} up_bytes={} down_bytes={} up_pkts={} down_pkts={} avg_down_Bps={:.1}",
+        label, ws.diagnostic_id(), dc, is_media,
+        first_up_ms.load(Ordering::Relaxed), first_down_ms.load(Ordering::Relaxed),
+        up_bytes.load(Ordering::Relaxed), down_bytes.load(Ordering::Relaxed),
+        up_packets.load(Ordering::Relaxed), down_packets.load(Ordering::Relaxed),
+        down_bytes.load(Ordering::Relaxed) as f64 / elapsed.max(0.001));
     ws.close().await;
 }
 
@@ -1602,21 +1632,24 @@ pub async fn handle_client(
 ) {
     STATS.connections_total.fetch_add(1, Ordering::Relaxed);
     STATS.connections_active.fetch_add(1, Ordering::Relaxed);
-    struct ActiveGuard;
+    let sid = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    struct ActiveGuard { sid: u64 }
     impl Drop for ActiveGuard {
         fn drop(&mut self) {
+            ldebug!("RC3 SESSION id={} event=finished", self.sid);
             if STATS.connections_active.load(Ordering::Relaxed) > 0 {
                 STATS.connections_active.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
-    let _guard = ActiveGuard;
+    let _guard = ActiveGuard { sid };
 
     let peer = conn
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut label = peer;
+    let mut label = format!("s{} {}", sid, peer);
+    ldebug!("RC3 SESSION id={} event=accepted", sid);
 
     let _ = conn.set_nodelay(true);
 
@@ -1631,7 +1664,7 @@ pub async fn handle_client(
                 if text.starts_with("PROXY ") {
                     let parts: Vec<&str> = text.split_whitespace().collect();
                     if parts.len() >= 6 {
-                        label = format!("{}:{}", parts[2], parts[4]);
+                        label = format!("s{} {}:{}", sid, parts[2], parts[4]);
                     }
                     ldebug!("[{}] PROXY protocol: {}", label, text);
                 } else {
