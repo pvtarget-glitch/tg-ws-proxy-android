@@ -9,7 +9,21 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+// Diagnostic IDs, never logged together with protocol payloads or keys.
+static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIAL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn error_class(err: &WsError) -> String {
+    match err {
+        WsError::Io(e) => format!("io:{:?}:os={:?}", e.kind(), e.raw_os_error()),
+        WsError::Handshake(h) => format!("http:{}", h.status_code),
+        WsError::Timeout => "timeout".to_string(),
+        WsError::Canceled => "canceled".to_string(),
+        WsError::Other(_) => "other".to_string(),
+    }
+}
 use std::sync::Arc;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -334,6 +348,7 @@ enum WsWriter {
 }
 
 pub struct RawWebSocket {
+    id: u64,
     reader: tokio::sync::Mutex<WsReader>,
     writer: tokio::sync::Mutex<WsWriter>,
     frag: tokio::sync::Mutex<Vec<u8>>,
@@ -342,6 +357,9 @@ pub struct RawWebSocket {
 }
 
 impl RawWebSocket {
+    pub fn diagnostic_id(&self) -> u64 {
+        self.id
+    }
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
@@ -370,10 +388,12 @@ impl RawWebSocket {
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    ldebug!("RC3 WS id={} event=batch_write_error kind={:?} os={:?}", self.id, e.kind(), e.raw_os_error());
                     self.closed.store(true, Ordering::Relaxed);
                     return Err(WsError::Io(e));
                 }
                 Err(_) => {
+                    ldebug!("RC3 WS id={} event=batch_write_timeout", self.id);
                     self.closed.store(true, Ordering::Relaxed);
                     return Err(WsError::Timeout);
                 }
@@ -400,10 +420,12 @@ impl RawWebSocket {
         match res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
+                ldebug!("RC3 WS id={} event=write_error kind={:?} os={:?}", self.id, e.kind(), e.raw_os_error());
                 self.closed.store(true, Ordering::Relaxed);
                 Err(WsError::Io(e))
             }
             Err(_) => {
+                ldebug!("RC3 WS id={} event=write_timeout", self.id);
                 self.closed.store(true, Ordering::Relaxed);
                 Err(WsError::Timeout)
             }
@@ -422,6 +444,7 @@ impl RawWebSocket {
             let (opcode, payload, fin) = match self.read_frame().await {
                 Ok(v) => v,
                 Err(e) => {
+                    ldebug!("RC3 WS id={} event=read_error class={}", self.id, error_class(&e));
                     self.closed.store(true, Ordering::Relaxed);
                     return Err(e);
                 }
@@ -430,7 +453,7 @@ impl RawWebSocket {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
                     let (code, reason) = parse_close(&payload);
-                    ldebug!("WS OP_CLOSE from upstream: code={:?} reason={:?}", code, reason);
+                    ldebug!("RC3 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason.len());
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
@@ -474,8 +497,10 @@ impl RawWebSocket {
 
     pub async fn close(&self) {
         if self.closed.swap(true, Ordering::Relaxed) {
+            ldebug!("RC3 WS id={} event=close_already_marked", self.id);
             return;
         }
+        ldebug!("RC3 WS id={} event=local_close", self.id);
         // Best-effort close frame + shutdown транспорта.
         let frame = build_frame(OP_CLOSE, &[], true);
         let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
@@ -782,6 +807,7 @@ async fn handshake_tls(
         read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
+            id: NEXT_WS_ID.fetch_add(1, Ordering::Relaxed),
             reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
             writer: tokio::sync::Mutex::new(WsWriter::Tls(write_half)),
             frag: tokio::sync::Mutex::new(Vec::new()),
@@ -836,6 +862,7 @@ async fn handshake_plain(
         read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
+            id: NEXT_WS_ID.fetch_add(1, Ordering::Relaxed),
             reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
             writer: tokio::sync::Mutex::new(WsWriter::Plain(write_half)),
             frag: tokio::sync::Mutex::new(Vec::new()),
@@ -979,18 +1006,21 @@ async fn ws_connect_inner(
         Err(_) => format!("{}:{}", dial_addr, port),
     };
 
+    let dial_id = NEXT_DIAL_ID.fetch_add(1, Ordering::Relaxed);
+    ldebug!("RC3 DIAL id={} event=start transport={} timeout_ms={}", dial_id,
+        if secure { "tls" } else { "plain" }, timeout.as_millis());
     let started = std::time::Instant::now();
     let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
         Ok(Ok(c)) => {
-            ldebug!("RC2 stage=tcp result=ok elapsed_ms={}", started.elapsed().as_millis());
+            ldebug!("RC3 DIAL id={} stage=tcp result=ok elapsed_ms={}", dial_id, started.elapsed().as_millis());
             c
         }
         Ok(Err(e)) => {
-            ldebug!("RC2 stage=tcp result=io_error elapsed_ms={} kind={:?}", started.elapsed().as_millis(), e.kind());
+            ldebug!("RC3 DIAL id={} stage=tcp result=io_error elapsed_ms={} kind={:?} os={:?}", dial_id, started.elapsed().as_millis(), e.kind(), e.raw_os_error());
             return Err(WsError::Io(e));
         }
         Err(_) => {
-            ldebug!("RC2 stage=tcp result=timeout elapsed_ms={}", started.elapsed().as_millis());
+            ldebug!("RC3 DIAL id={} stage=tcp result=timeout elapsed_ms={}", dial_id, started.elapsed().as_millis());
             return Err(WsError::Timeout);
         }
     };
@@ -1000,7 +1030,7 @@ async fn ws_connect_inner(
         let (read_half, write_half) = tokio::io::split(raw_conn);
         let started = std::time::Instant::now();
         let result = handshake_plain(read_half, write_half, domain, path, timeout, dpi).await;
-        ldebug!("RC2 stage=ws result={} elapsed_ms={}", if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis());
+        ldebug!("RC3 DIAL id={} stage=ws result={} elapsed_ms={} ws_id={:?} error={:?}", dial_id, if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis(), result.as_ref().ok().map(|w| w.diagnostic_id()), result.as_ref().err().map(error_class));
         return result;
     }
 
@@ -1020,18 +1050,18 @@ async fn ws_connect_inner(
     let tls_conn =
         match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
             Ok(Ok(c)) => {
-                ldebug!("RC2 stage=tls result=ok elapsed_ms={}", started.elapsed().as_millis());
+                ldebug!("RC3 DIAL id={} stage=tls result=ok elapsed_ms={}", dial_id, started.elapsed().as_millis());
                 c
             }
             Ok(Err(e)) => {
-                ldebug!("RC2 stage=tls result=io_error elapsed_ms={} kind={:?}", started.elapsed().as_millis(), e.kind());
+                ldebug!("RC3 DIAL id={} stage=tls result=io_error elapsed_ms={} kind={:?} os={:?}", dial_id, started.elapsed().as_millis(), e.kind(), e.raw_os_error());
                 if e.kind() != std::io::ErrorKind::ConnectionReset {
                     ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
                 }
                 return Err(WsError::Io(e));
             }
             Err(_) => {
-                ldebug!("RC2 stage=tls result=timeout elapsed_ms={}", started.elapsed().as_millis());
+                ldebug!("RC3 DIAL id={} stage=tls result=timeout elapsed_ms={}", dial_id, started.elapsed().as_millis());
                 ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
                 return Err(WsError::Timeout);
             }
@@ -1040,7 +1070,7 @@ async fn ws_connect_inner(
     let (read_half, write_half) = tokio::io::split(tls_conn);
     let started = std::time::Instant::now();
     let result = handshake_tls(read_half, write_half, domain, path, timeout).await;
-    ldebug!("RC2 stage=ws result={} elapsed_ms={}", if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis());
+    ldebug!("RC3 DIAL id={} stage=ws result={} elapsed_ms={} ws_id={:?} error={:?}", dial_id, if result.is_ok() { "ok" } else { "error" }, started.elapsed().as_millis(), result.as_ref().ok().map(|w| w.diagnostic_id()), result.as_ref().err().map(error_class));
     result
 }
 
