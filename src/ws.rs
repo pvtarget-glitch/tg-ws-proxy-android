@@ -462,15 +462,16 @@ impl RawWebSocket {
             match opcode {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
-                    let (code, reason) = parse_close(&payload);
-                    ldebug!("RC3 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason.len());
+                    let (code, _) = parse_close(&payload);
+                    let reason_len = payload.len().saturating_sub(2);
+                    ldebug!("RC3 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason_len);
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
                     }
                     let reply = build_frame(OP_CLOSE, &close_payload, true);
                     let _ = self.write_frame(&reply, WS_CONTROL_TIMEOUT).await;
-                    return Err(WsError::RemoteClose { code, reason_len: reason.len() });
+                    return Err(WsError::RemoteClose { code, reason_len });
                 }
                 OP_PING => {
                     let pong = build_frame(OP_PONG, &payload, true);
@@ -543,15 +544,16 @@ impl RawWebSocket {
             match opcode {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
-                    let (code, reason) = parse_close(&payload);
-                    ldebug!("RC4 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason.len());
+                    let (code, _) = parse_close(&payload);
+                    let reason_len = payload.len().saturating_sub(2);
+                    ldebug!("RC4 WS id={} event=remote_close code={:?} reason_len={}", self.id, code, reason_len);
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
                     }
                     let reply = build_frame(OP_CLOSE, &close_payload, true);
                     let _ = self.write_frame(&reply, WS_CONTROL_TIMEOUT).await;
-                    return Err(WsError::RemoteClose { code, reason_len: reason.len() });
+                    return Err(WsError::RemoteClose { code, reason_len });
                 }
                 OP_PING => {
                     let pong = build_frame(OP_PONG, &payload, true);
@@ -1210,5 +1212,25 @@ pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWe
             Some(ws)
         }
         Err(_) => None,
+    }
+}
+
+
+#[cfg(test)]
+mod rc4_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn remote_close_is_distinct_from_transport_eof() {
+        let close = WsError::RemoteClose { code: Some(1000), reason_len: 0 };
+        let eof = WsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(error_class(&close), "remote_close:code=Some(1000):reason_len=0");
+        assert!(error_class(&eof).starts_with("io:UnexpectedEof:"));
+    }
+
+    #[test]
+    fn direct_backpressure_has_own_error_class() {
+        assert_eq!(error_class(&WsError::Busy), "direct_dial_busy");
+        assert_eq!(MAX_PARALLEL_DIRECT_WS, 4);
     }
 }
