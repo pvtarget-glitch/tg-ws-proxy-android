@@ -621,16 +621,10 @@ impl CfWorkerPool {
         }
     }
 
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
-        {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                return;
-            }
-            r.insert(dc);
-        }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
+    // Flowseal upstream parity: a pool hit must schedule a real refill.
+    // refill_now() owns the in-flight guard and clears it when the task finishes.
+    async fn schedule_refill(self: &Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+        self.refill_now(dc, fallback_dst, worker_domains).await;
     }
 
     pub async fn refill_now(
@@ -639,6 +633,10 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) {
+        // No destinations means no refill job and no stuck in-flight flag.
+        if worker_domains.is_empty() {
+            return;
+        }
         let should = {
             let mut r = self.refilling.lock().await;
             if r.contains(&dc) {
@@ -2436,3 +2434,15 @@ fn note_bad_handshake(label: &str) {
     }
 }
 
+
+#[cfg(test)]
+mod cf_worker_refill_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_worker_list_does_not_leave_refill_marked_running() {
+        let pool = Arc::new(CfWorkerPool::new(CancellationToken::new()));
+        pool.schedule_refill(2, "192.0.2.1".to_string(), vec![]).await;
+        assert!(!pool.refilling.lock().await.contains(&2));
+    }
+}
