@@ -65,7 +65,7 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
       - name: Kotlin tests
-        run: bash ./gradlew testUniversalDebugUnitTest --no-daemon
+        run: java -cp gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain testUniversalDebugUnitTest --no-daemon
 
   build:
     name: Native libs + APK
