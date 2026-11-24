@@ -88,6 +88,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedBindIp by settingsStore.bindIp.collectAsStateWithLifecycle(initialValue = "127.0.0.1")
     val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val savedCfMediaExperimental by settingsStore.cfMediaExperimental.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
@@ -123,6 +124,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var bindIpText by rememberSaveable(savedBindIp) { mutableStateOf(savedBindIp) }
     var selectedPoolSize by rememberSaveable(savedPoolSize) { mutableIntStateOf(savedPoolSize) }
     var cfEnabled by rememberSaveable(savedCfEnabled) { mutableStateOf(savedCfEnabled) }
+    var cfMediaExperimental by rememberSaveable(savedCfMediaExperimental) { mutableStateOf(savedCfMediaExperimental) }
     var customCfDomainEnabled by rememberSaveable(savedCustomDomainEnabled) { mutableStateOf(savedCustomDomainEnabled) }
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
     var secretKeyText by remember(savedSecretKey) { mutableStateOf(if (savedSecretKey == "LOADING") "" else savedSecretKey) }
@@ -147,7 +149,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 isDcAuto, dc1Text, dc2Text, dc3Text, dc4Text, dc5Text, dc203Text,
                 dc1mText, dc2mText, dc3mText, dc4mText, dc5mText, dc203mText,
                 experimentalMode, bindIpText, portText, selectedPoolSize,
-                cfEnabled, customCfDomainEnabled, customCfDomain, secretKeyText
+                cfEnabled, cfMediaExperimental, customCfDomainEnabled, customCfDomain, secretKeyText
             )
         }
     }
@@ -409,7 +411,30 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 )
             }
 
+
             if (cfEnabled) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        stringResource(com.amurcanov.tgwsproxy.R.string.experimental_cf_media),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = cfMediaExperimental,
+                        onCheckedChange = { cfMediaExperimental = it; scheduleSave() },
+                        enabled = !isRunning
+                    )
+                }
+                Text(
+                    stringResource(com.amurcanov.tgwsproxy.R.string.experimental_cf_media_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
                 // Свой CF-домен (kwsN.<домен> -> IP дата-центров, Proxied, SSL Flexible).
                 // Если задан, используется вместо общего списка доменов.
                 Row(
