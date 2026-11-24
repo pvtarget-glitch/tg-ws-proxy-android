@@ -32,6 +32,16 @@
     <string name="done">Готово</string>
     <string name="telegram_not_found">Telegram не найден!</string>
     <string name="event_log">Лог событий</string>
+    <string name="log_archive_stats">Сохранено: %1$d строк, %2$d байт (лимит: %3$d строк / 12 МиБ)</string>
+    <string name="log_archive_complete">Обрезан: нет. Копирование и TXT содержат все сохранённые записи, включая скрытые на экране.</string>
+    <string name="log_archive_truncated">Обрезан: да. Удалено старых записей: %1$d. Копирование и TXT содержат все оставшиеся.</string>
+    <string name="log_export_txt">Сохранить полный журнал в TXT</string>
+    <string name="log_export_saved">Полный сохранённый журнал экспортирован в TXT</string>
+    <string name="log_export_failed">Не удалось сохранить файл журнала</string>
+    <string name="log_copied_full">Скопирован весь сохранённый журнал</string>
+    <string name="log_clipboard_too_large">Буфер обмена не принял журнал. Используйте экспорт в TXT.</string>
+    <string name="log_share_use_txt">Журнал слишком большой для отправки текстом. Сохраните полный TXT-файл.</string>
+    <string name="log_share_title">Поделиться журналом</string>
     <string name="clear">Очистить</string>
     <string name="null_logs_disabled">NULL - логи отключены</string>
     <string name="info">Информация</string>
