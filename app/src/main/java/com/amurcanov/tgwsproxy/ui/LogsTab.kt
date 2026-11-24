@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -15,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
@@ -32,9 +35,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.LogEntry
+import com.amurcanov.tgwsproxy.LogJournalSnapshot
 import com.amurcanov.tgwsproxy.LogManager
 import com.amurcanov.tgwsproxy.SettingsStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -42,6 +52,33 @@ fun LogsTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val currentLogs by LogManager.logs.collectAsStateWithLifecycle()
+    val journalStats by LogManager.journalStats.collectAsStateWithLifecycle()
+    var pendingExport by remember { mutableStateOf<LogJournalSnapshot?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        val snapshot = pendingExport
+        pendingExport = null
+        if (uri != null && snapshot != null) {
+            scope.launch(Dispatchers.IO) {
+                val ok = runCatching {
+                    val output = context.contentResolver.openOutputStream(uri)
+                        ?: throw IOException("Could not open destination")
+                    output.bufferedWriter(Charsets.UTF_8).use { snapshot.writeTo(it) }
+                }.isSuccess
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        context,
+                        context.getString(
+                            if (ok) com.amurcanov.tgwsproxy.R.string.log_export_saved
+                            else com.amurcanov.tgwsproxy.R.string.log_export_failed
+                        ),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
 
     val savedInfo by settingsStore.logShowInfo.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_LOG_SHOW_INFO)
     val savedError by settingsStore.logShowError.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_LOG_SHOW_ERROR)
@@ -100,31 +137,79 @@ fun LogsTab(settingsStore: SettingsStore) {
                     Icon(Icons.Default.Delete, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.clear), tint = MaterialTheme.colorScheme.primary)
                 }
                 IconButton(onClick = {
-                    // Копируем полный журнал по порядку и с временем, а не то,
-                    // что поместилось на экран.
-                    val text = LogManager.fullText().ifEmpty {
-                        filteredLogs.joinToString("\n") { "${it.message} (x${it.count})" }
-                    }
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    val clip = ClipData.newPlainText("TgWsProxy Logs", text)
-                    clipboard.setPrimaryClip(clip)
-                    Toast.makeText(context, context.getString(com.amurcanov.tgwsproxy.R.string.copied), Toast.LENGTH_SHORT).show()
+                    // Clipboard receives the full retained journal, never
+                    // the filtered/compressed LazyColumn contents.
+                    val text = LogManager.snapshot().asText()
+                    val ok = runCatching {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("TgWsProxy Logs", text))
+                    }.isSuccess
+                    Toast.makeText(
+                        context,
+                        context.getString(
+                            if (ok) com.amurcanov.tgwsproxy.R.string.log_copied_full
+                            else com.amurcanov.tgwsproxy.R.string.log_clipboard_too_large
+                        ),
+                        Toast.LENGTH_LONG
+                    ).show()
                 }) {
                     Icon(Icons.Default.ContentCopy, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.copy), tint = MaterialTheme.colorScheme.primary)
                 }
                 IconButton(onClick = {
-                    // «Поделиться» файлом-текстом: удобнее, чем буфер обмена, для длинного лога.
-                    val text = LogManager.fullText()
-                    val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(android.content.Intent.EXTRA_SUBJECT, "TgWsProxy log")
-                        putExtra(android.content.Intent.EXTRA_TEXT, text)
-                    }
-                    context.startActivity(android.content.Intent.createChooser(send, "Отправить лог"))
+                    pendingExport = LogManager.snapshot()
+                    val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                    exportLauncher.launch("tg-ws-proxy-$stamp.txt")
                 }) {
-                    Icon(Icons.Default.Share, contentDescription = "Отправить лог", tint = MaterialTheme.colorScheme.primary)
+                    Icon(
+                        Icons.Default.SaveAlt,
+                        contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.log_export_txt),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+                IconButton(onClick = {
+                    val snapshot = LogManager.snapshot()
+                    if (snapshot.stats.bytes > 512_000) {
+                        Toast.makeText(
+                            context,
+                            context.getString(com.amurcanov.tgwsproxy.R.string.log_share_use_txt),
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(android.content.Intent.EXTRA_SUBJECT, "TgWsProxy log")
+                            putExtra(android.content.Intent.EXTRA_TEXT, snapshot.asText())
+                        }
+                        context.startActivity(android.content.Intent.createChooser(
+                            send, context.getString(com.amurcanov.tgwsproxy.R.string.log_share_title)
+                        ))
+                    }
+                }) {
+                    Icon(Icons.Default.Share, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.log_share_title), tint = MaterialTheme.colorScheme.primary)
                 }
             }
+        }
+
+        Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+            Text(
+                stringResource(
+                    com.amurcanov.tgwsproxy.R.string.log_archive_stats,
+                    journalStats.stored,
+                    journalStats.bytes,
+                    journalStats.maxEntries
+                ),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                if (journalStats.truncated) stringResource(
+                    com.amurcanov.tgwsproxy.R.string.log_archive_truncated,
+                    journalStats.evicted
+                ) else stringResource(com.amurcanov.tgwsproxy.R.string.log_archive_complete),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (journalStats.truncated) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
         Row(
