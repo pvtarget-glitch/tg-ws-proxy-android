@@ -3,6 +3,7 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
+use crate::pool_policy::{refill_backoff_secs, refill_batch_size};
 use crate::transport_policy::DirectFailure;
 use crate::{ldebug, linfo, lwarn};
 use byteorder::{ByteOrder, LittleEndian};
@@ -135,6 +136,7 @@ pub struct WsPool {
     slots: Mutex<HashMap<DcSlot, Arc<SlotState>>>,
     rotating: Mutex<HashSet<DcSlot>>,
     refill_failures: Mutex<HashMap<DcSlot, (u32, f64)>>,
+    generation: AtomicU64,
     cancel_token: CancellationToken,
 }
 
@@ -144,6 +146,7 @@ impl WsPool {
             slots: Mutex::new(HashMap::new()),
             rotating: Mutex::new(HashSet::new()),
             refill_failures: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
             cancel_token,
         }
     }
@@ -261,37 +264,52 @@ impl WsPool {
             return;
         }
         let needed = pool_sz - cur_len;
+        let planned = refill_batch_size(needed);
+        let generation = self.generation.load(Ordering::SeqCst);
+        ldebug!("ARCH POOL event=refill_batch dc={} media={} needed={} scheduled={} generation={}",
+            slot.dc, slot.is_media != 0, needed, planned, generation);
 
-        let mut handles = Vec::new();
-        for _ in 0..needed {
-            let target_ip = target_ip.clone();
-            let domains = domains.clone();
-            let cancel = self.cancel_token.clone();
-            handles.push(tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    r = connect_one_ws(&target_ip, &domains) => r,
-                }
-            }));
-        }
-
+        // No spawn-per-missing-connection storm. At most two sequential dials
+        // per DC slot; failures stop the batch and trigger a measured backoff.
+        // Other slots remain concurrent, bounded by the global dial scheduler.
         let mut connected = 0;
-        for h in handles {
-            if let Ok(Some(ws)) = h.await {
-                let now = now_monotonic();
-                let mut q = state.queue.lock().await;
-                if q.len() < 16 {
-                    ldebug!("RC3 POOL event=insert dc={} media={} ws_id={}",
-                        slot.dc, slot.is_media != 0, ws.diagnostic_id());
-                    q.push_back(PoolEntry { ws, created: now });
-                    connected += 1;
-                } else {
-                    drop(q);
-                    tokio::spawn(async move {
-                        ws.close().await;
-                    });
-                }
+        let mut attempted = 0;
+        for _ in 0..planned {
+            if self.cancel_token.is_cancelled()
+                || generation != self.generation.load(Ordering::SeqCst)
+            {
+                break;
             }
+            attempted += 1;
+            let result = tokio::select! {
+                _ = self.cancel_token.cancelled() => None,
+                r = connect_one_ws(&target_ip, &domains) => r,
+            };
+            let ws = match result {
+                Some(ws) => ws,
+                None => break, // Do not fill the queue with speculative retries.
+            };
+            let mut q = state.queue.lock().await;
+            if generation != self.generation.load(Ordering::SeqCst) {
+                drop(q);
+                ws.close().await;
+                break; // Network changed during dial; discard the old path.
+            }
+            if q.len() < pool_sz {
+                ldebug!("RC3 POOL event=insert dc={} media={} ws_id={}",
+                    slot.dc, slot.is_media != 0, ws.diagnostic_id());
+                q.push_back(PoolEntry { ws, created: now_monotonic() });
+                connected += 1;
+            } else {
+                drop(q);
+                ws.close().await;
+            }
+        }
+        ldebug!("ARCH POOL event=batch_done dc={} media={} attempted={} connected={}",
+            slot.dc, slot.is_media != 0, attempted, connected);
+        // A stale generation should not score a network failure.
+        if generation != self.generation.load(Ordering::SeqCst) {
+            return;
         }
 
         if connected > 0 {
@@ -312,12 +330,10 @@ impl WsPool {
             }
             self.schedule_rotation(slot, target_ip, domains).await;
         } else {
-            // Экспоненциальный backoff 1s..3600s как в оригинале.
+            // Slow/failed networks get an increasing, capped refill pause.
             let mut failures = self.refill_failures.lock().await;
             let count = failures.get(&slot).map(|(c, _)| *c).unwrap_or(0) + 1;
-            let shift = (count - 1).min(12);
-            let delay = (WS_POOL_REFILL_BACKOFF_INITIAL * (2u64.pow(shift) as f64))
-                .min(ws_pool_refill_backoff_max());
+            let delay = refill_backoff_secs(count, ws_pool_refill_backoff_max());
             failures.insert(slot, (count, now_monotonic() + delay));
             drop(failures);
             linfo!(
@@ -515,7 +531,36 @@ impl WsPool {
         }
     }
 
+    // Keep active sessions alive, but discard idle sockets created under the
+    // old Android default network. A generation protects against stale dials
+    // completing after the callback.
+    pub async fn network_changed(self: &Arc<Self>) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.close_all().await;
+        self.refill_failures.lock().await.clear();
+        set_ws_pool_fronting_first(true);
+        linfo!("ARCH POOL event=network_changed generation={} idle_drained=true", generation);
+        // Existing refill jobs release their own in-flight guards when done.
+        // Follow-up warmup retries allow them to finish without racing resets.
+        let pool = self.clone();
+        let cancel = self.cancel_token.clone();
+        let dc_map = DC_OPT.read().clone();
+        tokio::spawn(async move {
+            for wait in [2, 12, 20] {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                }
+                if generation != pool.generation.load(Ordering::SeqCst) {
+                    return; // A newer network change owns warmup.
+                }
+                pool.warmup(&dc_map).await;
+            }
+        });
+    }
+
     pub async fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.close_all().await;
         self.slots.lock().await.clear();
         self.rotating.lock().await.clear();
