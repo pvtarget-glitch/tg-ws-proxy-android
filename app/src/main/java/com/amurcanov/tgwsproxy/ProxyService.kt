@@ -199,6 +199,9 @@ class ProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Capture diagnostics throughout the foreground-service lifetime,
+        // including when the UI is closed.
+        LogManager.startListening()
         createNotificationChannel()
         registerNetworkDiagnostics()
     }
@@ -206,7 +209,8 @@ class ProxyService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                LogManager.clearLogs()
+                // Do not erase previous test runs when the service restarts.
+                // The user may clear the journal explicitly in the Logs tab.
                 val bindIp = intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 1443)
                 val ips = intent.getStringExtra(EXTRA_IPS) ?: ""
