@@ -3,6 +3,7 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
+use crate::media_cf::{suspicious_media_cf_end, GateReject, MediaCfPermit, MEDIA_CF_GATE};
 use crate::pool_policy::{
     early_upstream_close, idle_reuse_max_secs, pool_entry_reusable,
     refill_backoff_secs, refill_batch_size, target_cooldown_remaining_secs,
@@ -903,6 +904,13 @@ pub fn is_http_transport(data: &[u8]) -> bool {
 // Сессионная статистика как в bridge_ws_reencrypt оригинала.
 // ---------------------------------------------------------------------------
 
+/// Metadata only: no decrypted Telegram content or protocol keys.
+pub struct BridgeOutcome {
+    pub elapsed: f64,
+    pub down_bytes: i64,
+    pub close_reason: String,
+}
+
 pub async fn bridge_ws<R, W>(
     conn_read: R,
     conn_write: W,
@@ -916,7 +924,8 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-) where
+) -> BridgeOutcome
+where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -1168,6 +1177,11 @@ pub async fn bridge_ws<R, W>(
         up_packets.load(Ordering::Relaxed), down_packets.load(Ordering::Relaxed),
         down_bytes.load(Ordering::Relaxed) as f64 / elapsed.max(0.001));
     ws.close().await;
+    BridgeOutcome {
+        elapsed,
+        down_bytes: down_bytes.load(Ordering::Relaxed),
+        close_reason,
+    }
 }
 
 /// Совместимость: bridge по TcpStream (разрезаем внутри).
