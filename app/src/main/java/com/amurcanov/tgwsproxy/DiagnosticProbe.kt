@@ -39,7 +39,7 @@ internal object DiagnosticProbe {
             repeat(2) { i ->
                 val start = System.nanoTime()
                 var ok = false
-                val reason: String
+                var reason = ""
                 try {
                     val address = net.getAllByName(host).first()
                     net.socketFactory.createSocket().use { socket ->

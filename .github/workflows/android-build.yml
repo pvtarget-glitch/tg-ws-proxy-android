@@ -47,10 +47,30 @@ jobs:
       - name: Cargo test
         run: cargo test --lib --locked
 
+  kotlin-test:
+    name: Kotlin diagnostics tests (fast)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+      - name: Kotlin tests
+        run: bash ./gradlew testUniversalDebugUnitTest --no-daemon
+
   build:
     name: Native libs + APK
     runs-on: windows-latest
-    needs: rust-test
+    needs: [rust-test, kotlin-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
