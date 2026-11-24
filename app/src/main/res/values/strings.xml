@@ -20,6 +20,8 @@
     <string name="connection">Connection</string>
     <string name="port">Port</string>
     <string name="auto_cf_enabled">Auto (CF enabled)</string>
+    <string name="experimental_cf_media">Experimental CF fallback for media</string>
+    <string name="experimental_cf_media_hint">Off by default. May lead to failed photo/video loads. Stop the proxy before changing this setting and start it again to apply.</string>
     <string name="configure_dc_addresses">Configure DC addresses</string>
     <string name="ws_pool">WS pool</string>
     <string name="secret_key">Secret key</string>
