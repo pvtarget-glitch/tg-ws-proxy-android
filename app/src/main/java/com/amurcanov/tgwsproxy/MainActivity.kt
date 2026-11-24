@@ -193,9 +193,8 @@ fun MainContent(settingsStore: SettingsStore) {
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
 
-    DisposableEffect(Unit) {
+    LaunchedEffect(Unit) {
         LogManager.startListening()
-        onDispose { LogManager.stopListening() }
     }
 
     LaunchedEffect(updateCheckIntervalHours, updateLastCheckAt) {
@@ -580,38 +579,21 @@ private fun AppBackdrop(modifier: Modifier = Modifier) {
 }
 
 /**
- * Optimized LogManager: uses a Channel + batching approach to avoid
- * creating a new list on every single log line — reduces GC pressure
- * and eliminates UI jank caused by high-frequency log updates.
- *
- * Key optimizations:
- * - Channel-based buffering: log lines are queued, not applied immediately
- * - Batch processing: up to 20 lines applied per tick (every 150ms)
- * - On-screen list capped at 300, consecutive duplicates merged in place
- * - Full chronological log (up to 3000 lines, with time) kept for copy/share
+ * Process-wide logcat reader. The archive is written *before* the UI queue:
+ * slow Compose rendering cannot silently discard text needed for export.
+ * Screen only shows the latest 300 grouped messages; archive keeps up to
+ * 30,000 raw logcat records / 12 MiB (with explicit eviction stats).
  */
 object LogManager {
     val logs = MutableStateFlow<List<LogEntry>>(emptyList())
+    private val journal = LogJournal()
+    internal val journalStats = MutableStateFlow(journal.stats())
+    private val uiSkipped = AtomicLong(0)
 
-    // Полный журнал для копирования/отправки: по порядку, с временем, без
-    // склейки и перестановок. На экране — короткий список, тут — до FULL_CAP строк.
-    private const val FULL_CAP = 3000
-    private val fullLog = ArrayDeque<String>()
-    private val timeFmt = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+    internal fun snapshot(): LogJournalSnapshot = journal.snapshot()
+    fun fullText(): String = journal.snapshot().asText()
+    fun uiSkippedCount(): Long = uiSkipped.get()
 
-    @Synchronized
-    private fun appendFull(entry: LogEntry) {
-        val level = when (entry.priority) { 6 -> "E"; 5 -> "W"; 3 -> "D"; else -> "I" }
-        fullLog.addLast("${timeFmt.format(java.util.Date())} $level ${entry.message}")
-        while (fullLog.size > FULL_CAP) fullLog.removeFirst()
-    }
-
-    /** Весь журнал текстом, по порядку, для буфера обмена или «Поделиться». */
-    @Synchronized
-    fun fullText(): String = fullLog.joinToString("\n")
-
-    @Synchronized
-    private fun clearFull() = fullLog.clear()
     private var job: Job? = null
     private var logcatProcess: Process? = null
     private val nextKey = AtomicLong(0)
@@ -626,7 +608,7 @@ object LogManager {
             val readerJob = launch(Dispatchers.IO) {
                 try {
                     val pid = android.os.Process.myPid()
-                    val process = ProcessBuilder("logcat", "-v", "tag", "--pid", pid.toString())
+                    val process = ProcessBuilder("logcat", "-v", "time", "--pid", pid.toString())
                         .redirectErrorStream(true)
                         .start()
                         
@@ -636,7 +618,12 @@ object LogManager {
                         while (isActive) {
                             val line = try { reader.readLine() } catch (e: Exception) { null } ?: break
                             val entry = parseLine(line) ?: continue
-                            logChannel.trySend(entry)
+                            // Store the original timestamp, severity and every
+                            // metric immediately: UI throttling is independent.
+                            journal.append(line)
+                            if (!logChannel.trySend(entry).isSuccess) {
+                                uiSkipped.incrementAndGet()
+                            }
                         }
                     }
                 } catch (_: Exception) {
@@ -666,6 +653,9 @@ object LogManager {
                         pendingBatch.clear()
                     }
 
+                    // Metadata is published at the UI refresh rate, not for
+                    // every individual log record.
+                    journalStats.value = journal.stats()
                     // Throttle updates — 150ms between UI refreshes
                     delay(150)
                 }
@@ -706,8 +696,11 @@ object LogManager {
     }
 
     fun clearLogs() {
+        journal.clear()
+        while (logChannel.tryReceive().isSuccess) { /* discard old UI rows */ }
         logs.value = emptyList()
-        clearFull()
+        uiSkipped.set(0)
+        journalStats.value = journal.stats()
     }
 
     private fun parseLine(raw: String): LogEntry? {
@@ -736,14 +729,6 @@ object LogManager {
                 var msg = raw.substringAfter("TgWsProxy:").trim()
                 if (msg.startsWith("[ERROR]") || msg.startsWith("[WARN]") || msg.startsWith("[DEBUG]")) {
                      return null // Handled above, but just in case
-                }
-
-                // Strip dynamic metrics like ↑3.3KB ↓1.1KB 0.3с so that lines can collapse
-                if (msg.contains("↑")) {
-                    msg = msg.substringBefore("↑").trim()
-                }
-                if (msg.contains("↓")) {
-                    msg = msg.substringBefore("↓").trim()
                 }
 
                 message = msg
