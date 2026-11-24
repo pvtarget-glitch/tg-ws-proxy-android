@@ -403,6 +403,13 @@ pub struct Stats {
     pub pool_misses: AtomicI64,
     pub cf_pool_hits: AtomicI64,
     pub cf_pool_misses: AtomicI64,
+    // RC3 per-session media diagnostics, no message content is recorded.
+    pub ws_regular_sessions: AtomicI64,
+    pub ws_media_sessions: AtomicI64,
+    pub ws_regular_early_close: AtomicI64,
+    pub ws_media_early_close: AtomicI64,
+    pub ws_regular_down_bytes: AtomicI64,
+    pub ws_media_down_bytes: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -426,7 +433,7 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} ws_regular={} ws_media={} regular_early_close={} media_early_close={} regular_down={} media_down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
@@ -440,6 +447,12 @@ impl Stats {
             cf_pool_s,
             human_bytes(self.bytes_up.load(Ordering::Relaxed)),
             human_bytes(self.bytes_down.load(Ordering::Relaxed)),
+            self.ws_regular_sessions.load(Ordering::Relaxed),
+            self.ws_media_sessions.load(Ordering::Relaxed),
+            self.ws_regular_early_close.load(Ordering::Relaxed),
+            self.ws_media_early_close.load(Ordering::Relaxed),
+            human_bytes(self.ws_regular_down_bytes.load(Ordering::Relaxed)),
+            human_bytes(self.ws_media_down_bytes.load(Ordering::Relaxed)),
         )
     }
 
@@ -487,6 +500,12 @@ impl Stats {
         self.pool_misses.store(0, Ordering::Relaxed);
         self.cf_pool_hits.store(0, Ordering::Relaxed);
         self.cf_pool_misses.store(0, Ordering::Relaxed);
+        self.ws_regular_sessions.store(0, Ordering::Relaxed);
+        self.ws_media_sessions.store(0, Ordering::Relaxed);
+        self.ws_regular_early_close.store(0, Ordering::Relaxed);
+        self.ws_media_early_close.store(0, Ordering::Relaxed);
+        self.ws_regular_down_bytes.store(0, Ordering::Relaxed);
+        self.ws_media_down_bytes.store(0, Ordering::Relaxed);
     }
 }
 
