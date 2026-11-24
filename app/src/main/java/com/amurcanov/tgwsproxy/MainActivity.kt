@@ -641,7 +641,6 @@ object LogManager {
                     var received = logChannel.tryReceive()
                     while (received.isSuccess) {
                         val e = received.getOrThrow()
-                        appendFull(e)
                         pendingBatch.add(e)
                         if (pendingBatch.size >= 20) break // cap batch size
                         received = logChannel.tryReceive()
