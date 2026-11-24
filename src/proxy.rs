@@ -1541,6 +1541,28 @@ async fn cfproxy_acquire_ws(
 // добываются БЕЗ halves, затем halves уходят в bridge/tcp.
 // ---------------------------------------------------------------------------
 
+fn record_media_cf_outcome(
+    permit: &mut Option<MediaCfPermit<'_>>,
+    dc: i32,
+    route: &str,
+    outcome: &BridgeOutcome,
+) {
+    if let Some(p) = permit.as_mut() {
+        let suspicious = suspicious_media_cf_end(
+            outcome.elapsed, outcome.down_bytes, &outcome.close_reason
+        );
+        let cooldown = p.finish(now_monotonic(), suspicious);
+        if suspicious {
+            STATS.cf_media_short_fail.fetch_add(1, Ordering::Relaxed);
+        } else {
+            STATS.cf_media_healthy.fetch_add(1, Ordering::Relaxed);
+        }
+        linfo!("ARCH MEDIA_CF event=session_end dc={} route={} duration_ms={} down_bytes={} suspicious={} cooldown_secs={:.0} close={} classification=heuristic",
+            dc, route, (outcome.elapsed.max(0.0) * 1000.0) as u64,
+            outcome.down_bytes, suspicious, cooldown, outcome.close_reason);
+    }
+}
+
 pub async fn do_fallback<R, W>(
     pools: &ProxyPools,
     conn_read: R,
@@ -1564,12 +1586,35 @@ where
     let m_tag = if is_media { " media" } else { "" };
     let fallback_dst = resolve_fallback_target(dc, is_media, is_test);
     let skip_cf = media_skips_cf(is_media);
-    let use_cf = CFPROXY_ENABLED.load(Ordering::Relaxed) && !is_test && !skip_cf;
     let worker_domains = CF_WORKER_DOMAINS.read().clone();
+    let media_cf_requested = is_media && !skip_cf && !is_test
+        && (CFPROXY_ENABLED.load(Ordering::Relaxed) || !worker_domains.is_empty());
+    // Own one permit for the whole CF media trial (including the relay).
+    // This prevents repeated short-lived sessions from spinning up unlimited
+    // independent CF handshakes when the endpoint closes immediately.
+    let mut media_cf_permit = if media_cf_requested {
+        match MEDIA_CF_GATE.acquire(dc, now_monotonic()) {
+            Ok(permit) => {
+                STATS.cf_media_started.fetch_add(1, Ordering::Relaxed);
+                linfo!("ARCH MEDIA_CF event=trial_start dc={} max_per_dc=2", dc);
+                Some(permit)
+            }
+            Err((reason, retry_ms)) => {
+                STATS.cf_media_suppressed.fetch_add(1, Ordering::Relaxed);
+                linfo!("ARCH MEDIA_CF event=trial_suppressed dc={} reason={:?} retry_ms={}",
+                    dc, reason, retry_ms);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let media_cf_allowed = !media_cf_requested || media_cf_permit.is_some();
+    let use_cf = CFPROXY_ENABLED.load(Ordering::Relaxed) && !is_test && !skip_cf && media_cf_allowed;
     let ws_path = ws_path_for(is_test);
     let secure_port = if DISABLE_SECURE.load(Ordering::Relaxed) { 80 } else { 443 };
     let use_worker =
-        !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test && !skip_cf;
+        !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test && !skip_cf && media_cf_allowed;
     if skip_cf
         && !is_test
         && (CFPROXY_ENABLED.load(Ordering::Relaxed) || !worker_domains.is_empty())
@@ -1620,7 +1665,7 @@ where
         if let Some(ws) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             if ws.send(relay_init).await.is_ok() {
-                bridge_ws(
+                let outcome = bridge_ws(
                     conn_read,
                     conn_write,
                     ws,
@@ -1632,9 +1677,10 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
-                cancel_token,
+                    cancel_token,
                 )
                 .await;
+                record_media_cf_outcome(&mut media_cf_permit, dc, "worker", &outcome);
                 return true;
             }
             ws.close().await;
@@ -1652,7 +1698,7 @@ where
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
 
             if ws.send(relay_init).await.is_ok() {
-                bridge_ws(
+                let outcome = bridge_ws(
                     conn_read,
                     conn_write,
                     ws,
@@ -1667,6 +1713,7 @@ where
                     cancel_token,
                 )
                 .await;
+                record_media_cf_outcome(&mut media_cf_permit, dc, "cf_proxy", &outcome);
                 return true;
             }
             ws.close().await;
@@ -1674,6 +1721,15 @@ where
         }
         // CF не дал ws — halves НЕ тронуты, идём в TCP fallback ниже.
     }
+
+    // An unsuccessful CF setup counts as one failed trial regardless of how
+    // many worker/proxy candidates were tested internally.
+    if let Some(p) = media_cf_permit.as_mut() {
+        let cooldown = p.finish(now_monotonic(), true);
+        STATS.cf_media_short_fail.fetch_add(1, Ordering::Relaxed);
+        linfo!("ARCH MEDIA_CF event=connect_failed dc={} cooldown_secs={:.0}", dc, cooldown);
+    }
+    drop(media_cf_permit); // Release DC media quota before TCP fallback.
 
     // Шаг 3: tcp.
     if !fallback_dst.is_empty() {
