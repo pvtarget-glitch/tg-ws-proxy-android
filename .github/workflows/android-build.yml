@@ -19,7 +19,7 @@ on:
       version:
         description: 'Release tag (e.g. v1.2.4.0-cf)'
         required: false
-        default: 'v1.2.5.2-diag1'
+        default: 'v1.2.5.2-diag2'
   push:
     tags: ['v*']
     branches:
@@ -157,7 +157,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:INPUT_TAG }
           if ($env:GITHUB_REF -eq 'refs/heads/release/v1.2.5.1-log-export') { $tag = 'v1.2.5.1' }
-          if ($env:GITHUB_REF -eq 'refs/heads/experiment/v1.2.5.2-diag') { $tag = 'v1.2.5.2-diag1' }
+          if ($env:GITHUB_REF -eq 'refs/heads/experiment/v1.2.5.2-diag') { $tag = 'v1.2.5.2-diag2' }
           if ([string]::IsNullOrEmpty($tag)) { $tag = 'dev' }
           $ver = $tag.TrimStart('v')
           $map = @{ 'universal' = 'universal'; 'arm64' = 'v8a-minsdk24'; 'arm32' = 'v7a-minsdk21' }
@@ -198,7 +198,7 @@ jobs:
 
       - name: Release notes for this version
         env:
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag1') || github.event.inputs.version }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag2') || github.event.inputs.version }}
         run: |
           f="src/.github/release-notes/${TAG}.md"
           if [ -f "$f" ]; then
@@ -217,9 +217,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag1') || github.event.inputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag2') || github.event.inputs.version }}
           target_commitish: ${{ github.sha }}
-          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag1') || github.event.inputs.version }} (unofficial)
+          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || (github.ref == 'refs/heads/release/v1.2.5.1-log-export' && 'v1.2.5.1') || (github.ref == 'refs/heads/experiment/v1.2.5.2-diag' && 'v1.2.5.2-diag2') || github.event.inputs.version }} (unofficial)
           body_path: release-notes.md
           files: dist/*
           draft: false

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,7 +52,7 @@ import java.util.Locale
 fun LogsTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var showDiagnostics by remember { mutableStateOf(false) }
+    var showDiagnostics by rememberSaveable { mutableStateOf(false) }
     val currentLogs by LogManager.logs.collectAsStateWithLifecycle()
     val journalStats by LogManager.journalStats.collectAsStateWithLifecycle()
     var pendingExport by remember { mutableStateOf<LogJournalSnapshot?>(null) }

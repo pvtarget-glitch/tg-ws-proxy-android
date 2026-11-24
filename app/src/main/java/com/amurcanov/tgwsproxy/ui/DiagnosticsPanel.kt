@@ -14,6 +14,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.amurcanov.tgwsproxy.DiagnosticAnalyzer
 import com.amurcanov.tgwsproxy.DiagnosticProbe
+import com.amurcanov.tgwsproxy.DiagnosticExport
 import com.amurcanov.tgwsproxy.LogManager
 import com.amurcanov.tgwsproxy.R
 import kotlinx.coroutines.Dispatchers
@@ -31,19 +32,8 @@ internal fun DiagnosticsPanel(onClose: () -> Unit) {
     val scope = rememberCoroutineScope()
     var result by remember { mutableStateOf<DiagnosticAnalyzer.Report?>(null) }
     var busy by remember { mutableStateOf(false) }
-    var pendingJson by remember { mutableStateOf<String?>(null) }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
-        val json = pendingJson
-        pendingJson = null
-        if (uri != null && json != null) scope.launch(Dispatchers.IO) {
-            val ok = runCatching {
-                val stream = context.contentResolver.openOutputStream(uri) ?: error("No output stream")
-                stream.bufferedWriter(Charsets.UTF_8).use { it.write(json) }
-            }.isSuccess
-            withContext(Dispatchers.Main) {
-                Toast.makeText(context, context.getString(if (ok) R.string.diag_saved else R.string.log_export_failed), Toast.LENGTH_LONG).show()
-            }
-        }
+        if (uri != null) DiagnosticExport.saveToDocument(context, uri)
     }
     fun analyze(probes: List<DiagnosticProbe.Result> = emptyList()) {
         val journal = LogManager.snapshot()
@@ -78,9 +68,14 @@ internal fun DiagnosticsPanel(onClose: () -> Unit) {
         result?.let { r ->
             Text(r.summary(), style = MaterialTheme.typography.bodySmall)
             Button(onClick = {
-                pendingJson = reportJson(r).toString(2)
-                val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
-                export.launch("tg-ws-proxy-diag-$stamp.json")
+                val json = reportJson(r).toString(2)
+                val saved = runCatching { DiagnosticExport.prepare(context, json) }
+                if (saved.isSuccess) {
+                    val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+                    export.launch("tg-ws-proxy-diag-$stamp.json")
+                } else {
+                    Toast.makeText(context, context.getString(R.string.log_export_failed), Toast.LENGTH_LONG).show()
+                }
             }) { Text(stringResource(R.string.diag_export)) }
         }
         OutlinedButton(onClick = onClose) { Text(stringResource(R.string.diag_back)) }
@@ -90,7 +85,7 @@ internal fun DiagnosticsPanel(onClose: () -> Unit) {
 
 private fun reportJson(r: DiagnosticAnalyzer.Report): JSONObject = JSONObject().apply {
     put("schema", "tgwsproxy.diag.v1")
-    put("version", "1.2.5.2-diag1")
+    put("version", "1.2.5.2-diag2")
     put("total_lines", r.total)
     put("truncated", r.truncated)
     put("current_network", r.current)
