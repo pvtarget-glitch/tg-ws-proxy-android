@@ -1333,6 +1333,16 @@ pub async fn bridge_tcp_stream(
 static TCP_PORT_PREF: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<String, u16>>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+// A failed dual-port dial should not spawn dozens of identical 10-second
+// probes while Telegram retries media sockets. State is reset on network
+// changes, and does not affect already-established TCP connections.
+static TCP_FAIL_UNTIL: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static TCP_DIAL_LANES: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+const TCP_FAILURE_BACKOFF: Duration = Duration::from_secs(15);
+const TCP_ADMISSION_WAIT: Duration = Duration::from_millis(700);
+
 pub const TCP_FALLBACK_PORTS: [u16; 2] = [443, 80];
 
 #[cfg(not(test))]
@@ -1360,9 +1370,43 @@ fn tcp_real_port(port: u16) -> u16 {
 
 pub fn reset_tcp_port_pref() {
     TCP_PORT_PREF.lock().clear();
+    TCP_FAIL_UNTIL.lock().clear();
+    TCP_DIAL_LANES.lock().clear();
 }
 
 pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Option<TcpStream> {
+    // Before entering the dial queue, cheaply skip a destination whose two
+    // ports just timed out. All of this is per-destination, not global.
+    if let Some(until) = TCP_FAIL_UNTIL.lock().get(dst).copied() {
+        if std::time::Instant::now() < until {
+            ldebug!("ARCH TCP event=backoff_skip dst={} retry_ms={}",
+                dst, until.saturating_duration_since(std::time::Instant::now()).as_millis());
+            return None;
+        }
+    }
+    // One concurrent dual-port attempt per target is enough; queue briefly
+    // rather than stampeding the same blocked address from 10+ media sockets.
+    let lane = {
+        TCP_DIAL_LANES.lock().entry(dst.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))).clone()
+    };
+    let _admission = match tokio::time::timeout(TCP_ADMISSION_WAIT, lane.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            ldebug!("ARCH TCP event=local_capacity dst={} queue_wait_ms={}",
+                dst, TCP_ADMISSION_WAIT.as_millis());
+            return None;
+        }
+    };
+    // The previous holder may have established a failure backoff while we
+    // waited; don't make another identical attempt in that case.
+    if let Some(until) = TCP_FAIL_UNTIL.lock().get(dst).copied() {
+        if std::time::Instant::now() < until {
+            ldebug!("ARCH TCP event=backoff_skip dst={} retry_ms={}",
+                dst, until.saturating_duration_since(std::time::Instant::now()).as_millis());
+            return None;
+        }
+    }
     let first = TCP_PORT_PREF.lock().get(dst).copied().unwrap_or(preferred);
     let mut order: Vec<u16> = vec![first];
     for p in TCP_FALLBACK_PORTS.iter().copied().chain(std::iter::once(preferred)) {
@@ -1413,6 +1457,7 @@ pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Opt
                 let Some(Ok((port, r))) = joined else { continue };
                 match r {
                     Ok(stream) => {
+                        TCP_FAIL_UNTIL.lock().remove(dst);
                         let prev = TCP_PORT_PREF.lock().insert(dst.to_string(), port);
                         if port != preferred && prev != Some(port) {
                             linfo!("[{}] TCP fallback: {}:{} отвечает, порт {} — нет", label, dst, port, preferred);
@@ -1446,7 +1491,11 @@ pub async fn tcp_connect_any_port(dst: &str, preferred: u16, label: &str) -> Opt
             errors.push(format!("{}: timeout", p));
         }
     }
-    lwarn!("[{}] TCP fallback to {} failed: {}", label, dst, errors.join(", "));
+    TCP_FAIL_UNTIL.lock().insert(
+        dst.to_string(), std::time::Instant::now() + TCP_FAILURE_BACKOFF
+    );
+    lwarn!("[{}] TCP fallback to {} failed: {} (backoff {}s)",
+        label, dst, errors.join(", "), TCP_FAILURE_BACKOFF.as_secs());
     None
 }
 
@@ -2610,6 +2659,20 @@ mod tcp_port_tests {
         let t0 = tokio::time::Instant::now();
         assert!(tcp_connect_any_port("127.0.0.1", 80, "t").await.is_none());
         assert!(t0.elapsed() < TCP_SECOND_PORT_DELAY, "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn failed_dual_port_probe_is_cached_but_network_reset_clears_it() {
+        let _g = SERIAL.lock().await;
+        map(closed_port().await, closed_port().await);
+        assert!(tcp_connect_any_port("127.0.0.1", 443, "test").await.is_none());
+        assert!(TCP_FAIL_UNTIL.lock().contains_key("127.0.0.1"));
+        let t0 = tokio::time::Instant::now();
+        assert!(tcp_connect_any_port("127.0.0.1", 443, "test").await.is_none());
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        reset_tcp_port_pref();
+        assert!(TCP_FAIL_UNTIL.lock().is_empty());
+        assert!(TCP_DIAL_LANES.lock().is_empty());
     }
 }
 

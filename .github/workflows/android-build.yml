@@ -19,12 +19,13 @@ on:
       version:
         description: 'Release tag (e.g. v1.2.4.0-cf)'
         required: false
-        default: 'v1.2.5.2-diag2'
+        default: 'v1.2.5.3-diag3'
   push:
     tags: ['v*']
     branches:
       - 'release/v1.2.5.1-log-export'
       - 'experiment/v1.2.5.2-diag'
+      - 'experiment/v1.2.5.3-diag'
 
 permissions:
   contents: read
@@ -158,6 +159,7 @@ jobs:
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:INPUT_TAG }
           if ($env:GITHUB_REF -eq 'refs/heads/release/v1.2.5.1-log-export') { $tag = 'v1.2.5.1' }
           if ($env:GITHUB_REF -eq 'refs/heads/experiment/v1.2.5.2-diag') { $tag = 'v1.2.5.2-diag2' }
+          if ($env:GITHUB_REF -eq 'refs/heads/experiment/v1.2.5.3-diag') { $tag = 'v1.2.5.3-diag3' }
           if ([string]::IsNullOrEmpty($tag)) { $tag = 'dev' }
           $ver = $tag.TrimStart('v')
           $map = @{ 'universal' = 'universal'; 'arm64' = 'v8a-minsdk24'; 'arm32' = 'v7a-minsdk21' }

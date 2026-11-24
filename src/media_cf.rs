@@ -33,9 +33,21 @@ pub struct MediaCfGate {
 pub static MEDIA_CF_GATE: Lazy<MediaCfGate> = Lazy::new(MediaCfGate::default);
 
 pub fn suspicious_media_cf_end(elapsed: f64, down_bytes: i64, close_reason: &str) -> bool {
-    elapsed.is_finite() && elapsed >= 0.0 && elapsed < 5.0 &&
-        down_bytes >= 0 && down_bytes < 1024 &&
-        (close_reason.starts_with("upstream:") || close_reason == "normal")
+    if !elapsed.is_finite() || elapsed < 0.0 || down_bytes < 0 {
+        return false;
+    }
+    // A short and almost-empty session is suspicious even when its close is
+    // reported as normal. Keep this existing conservative heuristic.
+    let early_empty = elapsed < 5.0 && down_bytes < 1024 &&
+        (close_reason.starts_with("upstream:") || close_reason == "normal");
+
+    // On mobile, a CF media socket may remain open for 20-30 seconds, receive
+    // only a MTProto header, then die with an EOF. Time alone must not mark it
+    // healthy: the diagnostic trace showed 1291 bytes in 25 seconds before EOF.
+    // A long *normal* idle close is not classified as failure here.
+    let upstream_eof = close_reason.starts_with("upstream: io:UnexpectedEof") ||
+        close_reason.starts_with("upstream: io:ConnectionReset");
+    early_empty || (upstream_eof && down_bytes < 4096)
 }
 
 pub fn cooldown_seconds(failures: u32) -> f64 {
@@ -119,7 +131,11 @@ mod tests {
     fn failed_short_session_is_only_heuristic() {
         assert!(suspicious_media_cf_end(0.1, 24, "upstream: io:UnexpectedEof"));
         assert!(!suspicious_media_cf_end(0.3, 500000, "upstream: io:ConnectionReset"));
-        assert!(!suspicious_media_cf_end(10.0, 24, "upstream: io:UnexpectedEof"));
+        assert!(suspicious_media_cf_end(10.0, 24, "upstream: io:UnexpectedEof"));
+        assert!(suspicious_media_cf_end(25.5, 1291, "upstream: io:UnexpectedEof:os=None"));
+        assert!(!suspicious_media_cf_end(26.0, 1532, "normal"));
+        assert!(!suspicious_media_cf_end(25.5, 70000, "upstream: io:UnexpectedEof:os=None"));
+        assert!(!suspicious_media_cf_end(f64::NAN, 0, "upstream: io:UnexpectedEof"));
     }
 
     #[test]
