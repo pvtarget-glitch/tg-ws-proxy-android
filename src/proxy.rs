@@ -2597,6 +2597,23 @@ mod rc2_pool_regression {
     use super::*;
 
     #[tokio::test]
+    async fn confirmed_remote_cooldown_suppresses_speculative_pool_refill() {
+        let cancel = CancellationToken::new();
+        let pool = Arc::new(WsPool::new(cancel.clone()));
+        let slot = DcSlot { dc: 2, is_media: 1 };
+        let target = "192.0.2.243".to_string();
+        IP_FAIL_UNTIL.write().insert(target.clone(), now_monotonic() + 40.0);
+
+        pool.schedule_refill(slot, target.clone(), ws_domains(2, true)).await;
+
+        // Rejected before spawning a task or consuming any background permit.
+        assert_eq!(pool.get_slot(slot).await.refilling.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.idle_count().await, 0);
+        IP_FAIL_UNTIL.write().remove(&target);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn network_change_invalidates_pool_generation_and_failure_backoff() {
         let cancel = CancellationToken::new();
         let pool = Arc::new(WsPool::new(cancel.clone()));
