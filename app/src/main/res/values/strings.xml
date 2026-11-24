@@ -32,6 +32,16 @@
     <string name="done">Done</string>
     <string name="telegram_not_found">Telegram not found!</string>
     <string name="event_log">Event log</string>
+    <string name="log_archive_stats">Saved: %1$d lines, %2$d bytes (limit: %3$d lines / 12 MiB)</string>
+    <string name="log_archive_complete">Truncated: no. Copy and TXT export include all retained entries, even hidden on screen.</string>
+    <string name="log_archive_truncated">Truncated: yes. Oldest %1$d lines discarded. Copy/TXT include all remaining entries.</string>
+    <string name="log_export_txt">Save full log as TXT</string>
+    <string name="log_export_saved">Complete retained log saved to TXT</string>
+    <string name="log_export_failed">Could not save log file</string>
+    <string name="log_copied_full">Full retained log copied</string>
+    <string name="log_clipboard_too_large">Clipboard could not hold the log. Save as TXT instead.</string>
+    <string name="log_share_use_txt">Log too large to share as text. Use Save TXT to export the full journal.</string>
+    <string name="log_share_title">Share log</string>
     <string name="clear">Clear</string>
     <string name="null_logs_disabled">NULL - logs disabled</string>
     <string name="info">Info</string>
