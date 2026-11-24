@@ -85,7 +85,7 @@ pub unsafe extern "C" fn StartProxy(
     let is_verbose = verbose != 0;
 
     init_logging(is_verbose);
-    linfo!("Rust diagnostics build: 1.2.5.0-media-exp1");
+    linfo!("Rust diagnostics build: 1.2.5.3-diag3");
     cfproxy::clear_cfproxy_429_cooldowns();
     cf_routes::reset();
     proxy::reset_tcp_port_pref();
