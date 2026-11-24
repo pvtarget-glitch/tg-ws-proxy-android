@@ -30,36 +30,88 @@ class ProxyService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkRefreshJob: Job? = null
     @Volatile private var lastNetworkState: String = ""
+    @Volatile private var lastDefaultNetwork: String? = null
+    @Volatile private var lastTransportFingerprint: String? = null
 
+    // Android can report a VPN with more than one transport. Never use
+    // a single prioritized "cellular" label to infer whether a VPN is in use.
     private fun describeNetwork(cap: NetworkCapabilities?): String {
         if (cap == null) return "capabilities=unknown"
-        val transport = when {
-            cap.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            cap.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            cap.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-            cap.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
-            else -> "other"
-        }
-        return "transport=$transport validated=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}" +
+        val transports = listOfNotNull(
+            "vpn".takeIf { cap.hasTransport(NetworkCapabilities.TRANSPORT_VPN) },
+            "wifi".takeIf { cap.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) },
+            "cellular".takeIf { cap.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) },
+            "ethernet".takeIf { cap.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) }
+        ).joinToString(",").ifEmpty { "other" }
+        return "transports=$transports vpn=${cap.hasTransport(NetworkCapabilities.TRANSPORT_VPN)}" +
+                " not_vpn=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)}" +
+                " validated=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}" +
                 " internet=${cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}"
+    }
+
+    private fun transportFingerprint(id: String, cap: NetworkCapabilities): String {
+        return "$id:" + listOf(
+            NetworkCapabilities.TRANSPORT_VPN,
+            NetworkCapabilities.TRANSPORT_WIFI,
+            NetworkCapabilities.TRANSPORT_CELLULAR,
+            NetworkCapabilities.TRANSPORT_ETHERNET
+        ).joinToString(",") { if (cap.hasTransport(it)) "1" else "0" }
+    }
+
+    private fun scheduleNativeNetworkRefresh(reason: String) {
+        if (!_isRunning.value || stopInProgress) return
+        // Multiple Android callbacks describe the same transition: coalesce.
+        networkRefreshJob?.cancel()
+        networkRefreshJob = serviceScope.launch {
+            delay(800.milliseconds)
+            if (!_isRunning.value || stopInProgress) return@launch
+            try {
+                val result = NativeProxy.networkChanged()
+                Log.i("TgWsProxy", "ARCH NETWORK event=refresh reason=$reason native_result=$result")
+            } catch (e: Throwable) {
+                Log.w("TgWsProxy", "ARCH NETWORK event=refresh_failed type=${e.javaClass.simpleName}")
+            }
+        }
     }
 
     private fun registerNetworkDiagnostics() {
         val manager = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i("TgWsProxy", "RC3 NETWORK event=available")
+                val id = network.toString()
+                val previous = lastDefaultNetwork
+                lastDefaultNetwork = id
+                Log.i("TgWsProxy", "ARCH NETWORK event=available network=$id previous=${previous ?: "none"}")
+                if (previous != null && previous != id) {
+                    scheduleNativeNetworkRefresh("default_network_changed")
+                }
             }
+
             override fun onLost(network: Network) {
-                Log.i("TgWsProxy", "RC3 NETWORK event=lost")
-                lastNetworkState = ""
+                val id = network.toString()
+                Log.i("TgWsProxy", "ARCH NETWORK event=lost network=$id")
+                if (lastDefaultNetwork == id) {
+                    lastDefaultNetwork = null
+                    lastTransportFingerprint = null
+                    lastNetworkState = ""
+                    scheduleNativeNetworkRefresh("default_network_lost")
+                }
             }
+
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                val state = describeNetwork(caps)
+                val id = network.toString()
+                val state = "network=$id " + describeNetwork(caps)
                 if (lastNetworkState != state) {
                     lastNetworkState = state
-                    Log.i("TgWsProxy", "RC3 NETWORK event=capabilities $state")
+                    Log.i("TgWsProxy", "ARCH NETWORK event=capabilities $state")
+                }
+                val fingerprint = transportFingerprint(id, caps)
+                val previous = lastTransportFingerprint
+                lastTransportFingerprint = fingerprint
+                if (previous != null && previous != fingerprint) {
+                    scheduleNativeNetworkRefresh("transport_changed")
                 }
             }
         }
@@ -72,20 +124,24 @@ class ProxyService : Service() {
             }
             networkManager = manager
             networkCallback = callback
-            Log.i("TgWsProxy", "RC3 NETWORK event=registered sdk=${Build.VERSION.SDK_INT}")
+            Log.i("TgWsProxy", "ARCH NETWORK event=registered sdk=${Build.VERSION.SDK_INT}")
         } catch (e: Exception) {
-            Log.w("TgWsProxy", "RC3 NETWORK event=register_failed type=${e.javaClass.simpleName}")
+            Log.w("TgWsProxy", "ARCH NETWORK event=register_failed type=${e.javaClass.simpleName}")
         }
     }
 
     private fun unregisterNetworkDiagnostics() {
+        networkRefreshJob?.cancel()
+        networkRefreshJob = null
         try {
             networkCallback?.let { networkManager?.unregisterNetworkCallback(it) }
         } catch (e: Exception) {
-            Log.w("TgWsProxy", "RC3 NETWORK event=unregister_failed type=${e.javaClass.simpleName}")
+            Log.w("TgWsProxy", "ARCH NETWORK event=unregister_failed type=${e.javaClass.simpleName}")
         } finally {
             networkCallback = null
             networkManager = null
+            lastDefaultNetwork = null
+            lastTransportFingerprint = null
         }
     }
     private var statsJob: Job? = null
