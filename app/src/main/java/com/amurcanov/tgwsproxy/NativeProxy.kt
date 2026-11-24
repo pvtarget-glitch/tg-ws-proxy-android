@@ -16,6 +16,7 @@ interface ProxyLibrary : Library {
     fun SetBufferSizeKb(kb: Int)
     fun SetCfProxyCacheDir(cacheDir: String)
     fun SetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
+    fun SetCfMediaEnabled(enabled: Int)
     fun SetCfWorkerDomains(domains: String)
     fun SetFakeTlsDomain(domain: String)
     fun SetDisableSecure(v: Int)
@@ -57,6 +58,10 @@ object NativeProxy {
             if (priority) 1 else 0,
             userDomain
         )
+    }
+
+    fun setCfMediaEnabled(enabled: Boolean) {
+        ProxyLibrary.INSTANCE.SetCfMediaEnabled(if (enabled) 1 else 0)
     }
 
     fun setCfWorkerDomains(domains: String) {
