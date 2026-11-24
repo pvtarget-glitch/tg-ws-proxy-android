@@ -921,6 +921,11 @@ pub async fn bridge_ws<R, W>(
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let dc_tag = format!("DC{}{}", dc, if is_media { "m" } else { "" });
+    if is_media {
+        STATS.ws_media_sessions.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATS.ws_regular_sessions.fetch_add(1, Ordering::Relaxed);
+    }
     let ws = Arc::new(ws);
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     let cancel = Arc::new(tokio::sync::Notify::new());
@@ -1096,6 +1101,11 @@ pub async fn bridge_ws<R, W>(
             let n = data.len();
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
+            if is_media {
+                STATS.ws_media_down_bytes.fetch_add(n as i64, Ordering::Relaxed);
+            } else {
+                STATS.ws_regular_down_bytes.fetch_add(n as i64, Ordering::Relaxed);
+            }
             down_packets_c.fetch_add(1, Ordering::Relaxed);
             *la_down.lock().await = std::time::Instant::now();
 
@@ -1126,6 +1136,17 @@ pub async fn bridge_ws<R, W>(
         }
     };
     let elapsed = now_monotonic() - start;
+    let early_close = early_upstream_close(elapsed, down_bytes.load(Ordering::Relaxed), &close_reason);
+    if early_close {
+        if is_media {
+            STATS.ws_media_early_close.fetch_add(1, Ordering::Relaxed);
+        } else {
+            STATS.ws_regular_early_close.fetch_add(1, Ordering::Relaxed);
+        }
+        linfo!("ARCH SESSION event=early_upstream_close ws_id={} dc={} media={} duration_ms={} up_bytes={} down_bytes={} cause={} classification=heuristic",
+            ws.diagnostic_id(), dc, is_media, (elapsed.max(0.0) * 1000.0) as u64,
+            up_bytes.load(Ordering::Relaxed), down_bytes.load(Ordering::Relaxed), close_reason);
+    }
     linfo!(
         "[{}] {} WS session closed ({}): ^{}{} ({} pkts) v{}{} ({} pkts) in {:.1}s",
         label,
