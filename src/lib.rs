@@ -9,6 +9,7 @@ pub mod cf_routes;
 pub mod connection_manager;
 pub mod transport_policy;
 pub mod pool_policy;
+pub mod media_cf;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -84,10 +85,14 @@ pub unsafe extern "C" fn StartProxy(
     let is_verbose = verbose != 0;
 
     init_logging(is_verbose);
-    linfo!("Rust diagnostics build: 1.2.5.0-rc3");
+    linfo!("Rust diagnostics build: 1.2.5.0-media-exp1");
     cfproxy::clear_cfproxy_429_cooldowns();
     cf_routes::reset();
     proxy::reset_tcp_port_pref();
+    media_cf::MEDIA_CF_GATE.reset();
+    linfo!("ARCH MEDIA_CF event=start enabled={} max_per_dc={} cooldown_start_secs={}",
+        CF_MEDIA.load(Ordering::Relaxed), media_cf::MEDIA_CF_CONCURRENT_PER_DC,
+        media_cf::MEDIA_CF_COOLDOWN_START_SECS);
 
     if secret_str.len() == 32 {
         if hex::decode(&secret_str).is_ok() {
@@ -182,6 +187,8 @@ pub extern "C" fn StopProxy() -> c_int {
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
+    media_cf::MEDIA_CF_GATE.reset();
+    CF_MEDIA.store(false, Ordering::Relaxed);
     proxy::set_ws_pool_fronting_first(true);
 
     linfo!("StopProxy: exit");
@@ -206,6 +213,7 @@ pub extern "C" fn NetworkChanged() -> c_int {
         DC_FAIL_UNTIL.write().clear();
         WS_BLACKLIST.write().clear();
         proxy::reset_tcp_port_pref();
+        media_cf::MEDIA_CF_GATE.reset();
         pools.ws.network_changed().await;
         pools.cf_worker.close_all().await;
         linfo!("ARCH NETWORK event=native_change result=ok active_sessions=preserved");
@@ -273,6 +281,13 @@ pub unsafe extern "C" fn SetCfProxyConfig(
             .write()
             .update_domains_list(&cfg.domains);
     }
+}
+
+/// Experimental media CF fallback. Must be configured before StartProxy.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetCfMediaEnabled(enabled: c_int) {
+    CF_MEDIA.store(enabled != 0, Ordering::Relaxed);
+    media_cf::MEDIA_CF_GATE.reset();
 }
 
 /// # Safety
