@@ -2547,3 +2547,22 @@ mod cf_worker_refill_regression {
         assert!(!pool.refilling.lock().await.contains(&2));
     }
 }
+
+#[cfg(test)]
+mod rc2_pool_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn network_change_invalidates_pool_generation_and_failure_backoff() {
+        let cancel = CancellationToken::new();
+        let pool = Arc::new(WsPool::new(cancel.clone()));
+        let slot = DcSlot { dc: 2, is_media: 0 };
+        pool.refill_failures.lock().await.insert(slot, (5, now_monotonic() + 90.0));
+
+        pool.network_changed().await;
+
+        assert_eq!(pool.generation.load(Ordering::SeqCst), 1);
+        assert!(pool.refill_failures.lock().await.is_empty());
+        cancel.cancel();
+    }
+}
