@@ -139,4 +139,12 @@
     <string name="interval_never">Never</string>
     <string name="interval_hours">%1$d h</string>
     <string name="port_is_not_available">Port %1$d is in use, please try another one</string>
+    <string name="diag_title">Network diagnostics (experimental)</string>
+    <string name="diag_notice">Opt-in TCP/DNS checks use the current default network (two tries per endpoint). The proxy is unchanged. A successful TCP connection does not prove media download. Default IPs only; custom DC settings are not tested.</string>
+    <string name="diag_analyze">Analyze saved log</string>
+    <string name="diag_probe">Run TCP/DNS checks</string>
+    <string name="diag_running">Testing current network...</string>
+    <string name="diag_export">Export JSON report</string>
+    <string name="diag_saved">Network diagnostic JSON saved</string>
+    <string name="diag_back">Back to log</string>
 </resources>

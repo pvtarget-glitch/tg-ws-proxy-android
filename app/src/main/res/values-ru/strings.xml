@@ -139,4 +139,12 @@
     <string name="interval_never">Никогда</string>
     <string name="interval_hours">%1$d ч</string>
     <string name="port_is_not_available">"Порт %1$d используется, пожалуйста попробуйте другой "</string>
+    <string name="diag_title">Диагностика сети (эксперимент)</string>
+    <string name="diag_notice">Проверки TCP/DNS запускаются вручную на текущей сети (2 попытки на адрес). Настройки прокси не меняются. Успешный TCP не гарантирует загрузку медиа. Проверяются стандартные IP, без пользовательских DC.</string>
+    <string name="diag_analyze">Анализ журнала</string>
+    <string name="diag_probe">Проверить TCP/DNS</string>
+    <string name="diag_running">Проверка текущей сети...</string>
+    <string name="diag_export">Экспорт JSON</string>
+    <string name="diag_saved">Диагностический JSON сохранён</string>
+    <string name="diag_back">Назад к журналу</string>
 </resources>

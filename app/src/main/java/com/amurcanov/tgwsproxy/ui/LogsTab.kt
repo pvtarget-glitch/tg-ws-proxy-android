@@ -51,6 +51,7 @@ import java.util.Locale
 fun LogsTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var showDiagnostics by remember { mutableStateOf(false) }
     val currentLogs by LogManager.logs.collectAsStateWithLifecycle()
     val journalStats by LogManager.journalStats.collectAsStateWithLifecycle()
     var pendingExport by remember { mutableStateOf<LogJournalSnapshot?>(null) }
@@ -212,6 +213,13 @@ fun LogsTab(settingsStore: SettingsStore) {
             )
         }
 
+        OutlinedButton(onClick = { showDiagnostics = !showDiagnostics },
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+            Text(stringResource(com.amurcanov.tgwsproxy.R.string.diag_title))
+        }
+        if (showDiagnostics) {
+            DiagnosticsPanel(onClose = { showDiagnostics = false })
+        } else {
         Row(
             modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -247,6 +255,7 @@ fun LogsTab(settingsStore: SettingsStore) {
                     LogLine(entry)
                 }
             }
+        }
         }
     }
 }
