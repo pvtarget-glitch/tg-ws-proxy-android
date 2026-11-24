@@ -410,6 +410,10 @@ pub struct Stats {
     pub ws_media_early_close: AtomicI64,
     pub ws_regular_down_bytes: AtomicI64,
     pub ws_media_down_bytes: AtomicI64,
+    pub cf_media_started: AtomicI64,
+    pub cf_media_short_fail: AtomicI64,
+    pub cf_media_healthy: AtomicI64,
+    pub cf_media_suppressed: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -433,7 +437,7 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} ws_regular={} ws_media={} regular_early_close={} media_early_close={} regular_down={} media_down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} ws_regular={} ws_media={} regular_early_close={} media_early_close={} regular_down={} media_down={} cf_media_started={} cf_media_short_fail={} cf_media_healthy={} cf_media_suppressed={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
@@ -453,6 +457,10 @@ impl Stats {
             self.ws_media_early_close.load(Ordering::Relaxed),
             human_bytes(self.ws_regular_down_bytes.load(Ordering::Relaxed)),
             human_bytes(self.ws_media_down_bytes.load(Ordering::Relaxed)),
+            self.cf_media_started.load(Ordering::Relaxed),
+            self.cf_media_short_fail.load(Ordering::Relaxed),
+            self.cf_media_healthy.load(Ordering::Relaxed),
+            self.cf_media_suppressed.load(Ordering::Relaxed),
         )
     }
 
@@ -506,6 +514,10 @@ impl Stats {
         self.ws_media_early_close.store(0, Ordering::Relaxed);
         self.ws_regular_down_bytes.store(0, Ordering::Relaxed);
         self.ws_media_down_bytes.store(0, Ordering::Relaxed);
+        self.cf_media_started.store(0, Ordering::Relaxed);
+        self.cf_media_short_fail.store(0, Ordering::Relaxed);
+        self.cf_media_healthy.store(0, Ordering::Relaxed);
+        self.cf_media_suppressed.store(0, Ordering::Relaxed);
     }
 }
 
