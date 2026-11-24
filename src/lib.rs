@@ -8,6 +8,7 @@ pub mod balancer;
 pub mod cf_routes;
 pub mod connection_manager;
 pub mod transport_policy;
+pub mod pool_policy;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -83,7 +84,7 @@ pub unsafe extern "C" fn StartProxy(
     let is_verbose = verbose != 0;
 
     init_logging(is_verbose);
-    linfo!("Rust diagnostics build: 1.2.5.0-rc1");
+    linfo!("Rust diagnostics build: 1.2.5.0-rc2");
     cfproxy::clear_cfproxy_429_cooldowns();
     cf_routes::reset();
     proxy::reset_tcp_port_pref();
@@ -184,6 +185,31 @@ pub extern "C" fn StopProxy() -> c_int {
     proxy::set_ws_pool_fronting_first(true);
 
     linfo!("StopProxy: exit");
+    0
+}
+
+/// Invalidate idle connections and cached failures when Android's default
+/// network changes. Existing active relays continue; they are not terminated.
+#[unsafe(no_mangle)]
+pub extern "C" fn NetworkChanged() -> c_int {
+    let (pools, cancel) = {
+        let guard = state_cell().lock();
+        match guard.as_ref() {
+            Some(state) => (state.pools.clone(), state.cancel_tasks.clone()),
+            None => return -1,
+        }
+    };
+    runtime().spawn(async move {
+        if cancel.is_cancelled() { return; }
+        linfo!("ARCH NETWORK event=native_change action=invalidate_idle");
+        IP_FAIL_UNTIL.write().clear();
+        DC_FAIL_UNTIL.write().clear();
+        WS_BLACKLIST.write().clear();
+        proxy::reset_tcp_port_pref();
+        pools.ws.network_changed().await;
+        pools.cf_worker.close_all().await;
+        linfo!("ARCH NETWORK event=native_change result=ok active_sessions=preserved");
+    });
     0
 }
 
