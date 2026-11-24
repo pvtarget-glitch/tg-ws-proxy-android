@@ -3,7 +3,10 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
-use crate::pool_policy::{refill_backoff_secs, refill_batch_size};
+use crate::pool_policy::{
+    early_upstream_close, idle_reuse_max_secs, pool_entry_reusable,
+    refill_backoff_secs, refill_batch_size, target_cooldown_remaining_secs,
+};
 use crate::transport_policy::DirectFailure;
 use crate::{ldebug, linfo, lwarn};
 use byteorder::{ByteOrder, LittleEndian};
@@ -182,10 +185,11 @@ impl WsPool {
             let mut q = state.queue.lock().await;
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
-                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_closed() {
-                    ldebug!("RC3 POOL event=discard dc={} media={} ws_id={} age_ms={} reason={}",
+                if !pool_entry_reusable(age, is_media, entry.ws.is_closed()) {
+                    ldebug!("ARCH POOL event=discard dc={} media={} ws_id={} age_ms={} limit_ms={} reason={}",
                         dc, is_media, entry.ws.diagnostic_id(), (age.max(0.0) * 1000.0) as u64,
-                        if entry.ws.is_closed() { "locally_closed" } else { "max_age" });
+                        (idle_reuse_max_secs(is_media) * 1000.0) as u64,
+                        if entry.ws.is_closed() { "locally_closed" } else { "idle_age_limit" });
                     let e = entry;
                     tokio::spawn(async move {
                         e.ws.close().await;
@@ -222,6 +226,17 @@ impl WsPool {
         target_ip: String,
         domains: Vec<String>,
     ) {
+        // A confirmed TCP/WS network timeout for this target has already
+        // caused a remote cooldown. Do not spend background slots probing
+        // the same unavailable path while client sessions need capacity.
+        let remaining = target_cooldown_remaining_secs(
+            now_monotonic(), IP_FAIL_UNTIL.read().get(&target_ip).copied()
+        );
+        if remaining > 0.0 {
+            ldebug!("ARCH POOL event=defer_target_cooldown dc={} media={} remaining_ms={}",
+                slot.dc, slot.is_media != 0, (remaining * 1000.0) as u64);
+            return;
+        }
         // Backoff как в оригинале: не раньше _refill_after.
         {
             let failures = self.refill_failures.lock().await;
@@ -278,6 +293,14 @@ impl WsPool {
             if self.cancel_token.is_cancelled()
                 || generation != self.generation.load(Ordering::SeqCst)
             {
+                break;
+            }
+            let remaining = target_cooldown_remaining_secs(
+                now_monotonic(), IP_FAIL_UNTIL.read().get(&target_ip).copied()
+            );
+            if remaining > 0.0 {
+                ldebug!("ARCH POOL event=stop_batch_target_cooldown dc={} media={} remaining_ms={}",
+                    slot.dc, slot.is_media != 0, (remaining * 1000.0) as u64);
                 break;
             }
             attempted += 1;
@@ -425,7 +448,7 @@ impl WsPool {
                             let now = now_monotonic();
                             let min_expires = q
                                 .iter()
-                                .map(|e| e.created + WS_POOL_REUSE_MAX_AGE)
+                                .map(|e| e.created + idle_reuse_max_secs(slot.is_media != 0))
                                 .fold(f64::INFINITY, f64::min);
                             Some((min_expires - now).clamp(0.0, WS_POOL_CHECK_INTERVAL))
                         }
@@ -455,7 +478,7 @@ impl WsPool {
                 let mut ready = VecDeque::with_capacity(q.len());
                 let mut expired = Vec::new();
                 while let Some(e) = q.pop_front() {
-                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.is_closed() {
+                    if !pool_entry_reusable(now - e.created, slot.is_media != 0, e.ws.is_closed()) {
                         expired.push(e.ws);
                     } else {
                         ready.push_back(e);
