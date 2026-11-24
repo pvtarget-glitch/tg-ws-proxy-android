@@ -3,7 +3,7 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
-use crate::media_cf::{suspicious_media_cf_end, GateReject, MediaCfPermit, MEDIA_CF_GATE};
+use crate::media_cf::{suspicious_media_cf_end, MediaCfPermit, MEDIA_CF_GATE};
 use crate::pool_policy::{
     early_upstream_close, idle_reuse_max_secs, pool_entry_reusable,
     refill_backoff_secs, refill_batch_size, target_cooldown_remaining_secs,
